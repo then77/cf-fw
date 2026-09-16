@@ -1,0 +1,22 @@
+use std::time::Duration;
+
+pub const BASE_DOMAIN: &str = "fw.rlzy.me";
+pub const LOOPBACK_HOST: &str = "127.0.0.1";
+pub const MIN_PROXY_PORT: u16 = 10_000;
+pub const MAX_PROXY_PORT: u16 = 65_535;
+pub const CLOUDFLARE_DIRECTORY: &str = "cf";
+pub const CLOUDFLARED_FILENAME: &str = "cloudflared.exe";
+pub const CLOUDFLARE_CONFIG_FILENAME: &str = "cf-config.yml";
+pub const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(5);
+pub const DAEMON_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+pub const REMOTE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+pub const CHILD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+pub const CLOUDFLARED_STABILIZATION: Duration = Duration::from_millis(750);
+pub const SPINNER_TICK: Duration = Duration::from_millis(80);
+pub const STATS_INTERVAL: Duration = Duration::from_secs(1);
+pub const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub const UPSTREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+pub const MAX_IPC_FRAME: usize = 64 * 1024;
+pub const MAX_CLOUDFLARED_OUTPUT_BYTES: usize = 64 * 1024;
+pub const MAX_CLOUDFLARED_OUTPUT_LINES: usize = 100;
+pub const PROTOCOL_VERSION: u16 = 1;
