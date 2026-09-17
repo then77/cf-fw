@@ -7,6 +7,7 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use crate::config::SPINNER_TICK;
 const BRAILLE_TICKS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const HORIZONTAL_MARGIN: usize = 4;
+const MIN_PANEL_WIDTH: usize = 36;
 const ELLIPSIS: &str = "…";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,7 +194,8 @@ impl PanelLayout {
         .into_iter()
         .max()
         .unwrap_or_default()
-        .saturating_add(HORIZONTAL_MARGIN);
+        .saturating_add(HORIZONTAL_MARGIN)
+        .max(MIN_PANEL_WIDTH);
         let width = terminal_width
             .map(|available| natural_width.min(available))
             .unwrap_or(natural_width);
@@ -508,13 +510,29 @@ mod tests {
         .into_iter()
         .max()
         .unwrap()
-            + 4;
+            + HORIZONTAL_MARGIN;
+        let expected = expected.max(MIN_PANEL_WIDTH);
 
         assert_eq!(panel.width, expected);
         let rendered = panel.render_plain();
         assert_width(&rendered.destination, expected);
         assert_width(&rendered.source, expected);
         assert_width(&rendered.statistics, expected);
+    }
+
+    #[test]
+    fn short_urls_reserve_space_for_growing_statistics() {
+        let panel =
+            PanelLayout::for_port("https://nhy.fw.rlzy.me", 4321, &Statistics::default(), None);
+
+        assert_eq!(panel.width, MIN_PANEL_WIDTH);
+        let later_statistics = Statistics {
+            uploaded_bytes: 1_400,
+            downloaded_bytes: 1_900,
+            ..Statistics::default()
+        }
+        .to_string();
+        assert!(measure_text_width(&later_statistics) <= panel.width);
     }
 
     #[test]

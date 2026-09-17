@@ -281,7 +281,7 @@ mod tests {
         let metadata = SetupMetadata::from_values(Some("v1.2.3"), Some(&"A".repeat(64))).unwrap();
         assert_eq!(
             metadata.url(),
-            "https://github.com/then77/cf-forward/releases/download/v1.2.3/fw-setup.ps1"
+            "https://github.com/then77/cf-fw/releases/download/v1.2.3/fw-setup.ps1"
         );
         assert!(metadata.temp_path().ends_with("fw-setup-v1.2.3.ps1"));
         assert_eq!(metadata.sha256, "a".repeat(64));
