@@ -1,14 +1,12 @@
 use http::{HeaderMap, HeaderValue, Request, Uri, header};
 
-use crate::config::BASE_DOMAIN;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicHost {
     pub slug: String,
     pub hostname: String,
 }
 
-pub fn extract_public_host<B>(request: &Request<B>) -> Option<PublicHost> {
+pub fn extract_public_host<B>(request: &Request<B>, base_domain: &str) -> Option<PublicHost> {
     let authority = match request.uri().authority() {
         Some(authority) => authority.clone(),
         None => request
@@ -20,7 +18,7 @@ pub fn extract_public_host<B>(request: &Request<B>) -> Option<PublicHost> {
             .ok()?,
     };
 
-    parse_public_host(authority.host())
+    parse_public_host(authority.host(), base_domain)
 }
 
 pub fn rewrite_for_upstream<B>(
@@ -58,9 +56,9 @@ pub fn is_upgrade(headers: &HeaderMap) -> bool {
             .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
 }
 
-fn parse_public_host(host: &str) -> Option<PublicHost> {
+fn parse_public_host(host: &str, base_domain: &str) -> Option<PublicHost> {
     let hostname = host.to_ascii_lowercase();
-    let suffix = format!(".{BASE_DOMAIN}");
+    let suffix = format!(".{base_domain}");
     let slug = hostname.strip_suffix(&suffix)?;
 
     if !valid_slug(slug) {
@@ -96,7 +94,7 @@ mod tests {
             .body(())
             .unwrap();
 
-        let host = extract_public_host(&request).unwrap();
+        let host = extract_public_host(&request, "fw.rlzy.me").unwrap();
         assert_eq!(host.slug, "green-apple");
         assert_eq!(host.hostname, "green-apple.fw.rlzy.me");
     }
@@ -109,7 +107,10 @@ mod tests {
             .body(())
             .unwrap();
 
-        assert_eq!(extract_public_host(&request).unwrap().slug, "apple-pen");
+        assert_eq!(
+            extract_public_host(&request, "fw.rlzy.me").unwrap().slug,
+            "apple-pen"
+        );
     }
 
     #[test]
@@ -126,7 +127,10 @@ mod tests {
                 .header(header::HOST, host)
                 .body(())
                 .unwrap();
-            assert!(extract_public_host(&request).is_none(), "accepted {host}");
+            assert!(
+                extract_public_host(&request, "fw.rlzy.me").is_none(),
+                "accepted {host}"
+            );
         }
     }
 
@@ -136,6 +140,6 @@ mod tests {
             .header(header::HOST, "apple pen.fw.rlzy.me")
             .body(())
             .unwrap();
-        assert!(extract_public_host(&request).is_none());
+        assert!(extract_public_host(&request, "fw.rlzy.me").is_none());
     }
 }

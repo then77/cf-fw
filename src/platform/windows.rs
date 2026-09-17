@@ -194,7 +194,7 @@ pub fn spawn_daemon(executable: &Path) -> Result<Child> {
         .arg("--daemon")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .creation_flags(CREATE_NO_WINDOW);
     Ok(command.spawn()?)
 }

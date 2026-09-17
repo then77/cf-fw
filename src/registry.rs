@@ -27,8 +27,8 @@ impl Route {
         self.target.port()
     }
 
-    pub fn view(&self) -> RouteView {
-        RouteView::new(self.slug.clone(), self.port())
+    pub fn view(&self, base_domain: &str) -> RouteView {
+        RouteView::new(self.slug.clone(), self.port(), base_domain)
     }
 }
 
@@ -137,8 +137,12 @@ impl RouteRegistry {
         }
     }
 
-    pub fn list(&self) -> Vec<RouteView> {
-        let mut routes: Vec<_> = self.by_slug.values().map(Route::view).collect();
+    pub fn list(&self, base_domain: &str) -> Vec<RouteView> {
+        let mut routes: Vec<_> = self
+            .by_slug
+            .values()
+            .map(|route| route.view(base_domain))
+            .collect();
         routes.sort_unstable_by(|left, right| left.slug.cmp(&right.slug));
         routes
     }
@@ -300,9 +304,9 @@ mod tests {
         register(&mut registry, 8080, "zebra-route", 1);
         register(&mut registry, 4321, "apple-route", 2);
 
-        let routes = registry.list();
+        let routes = registry.list("mytunnel.me");
         assert_eq!(routes[0].slug, "apple-route");
         assert_eq!(routes[0].local_url, "http://127.0.0.1:4321");
-        assert_eq!(routes[0].public_url, "https://apple-route.fw.rlzy.me");
+        assert_eq!(routes[0].public_url, "https://apple-route.mytunnel.me");
     }
 }

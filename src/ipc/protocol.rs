@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::config::{BASE_DOMAIN, LOOPBACK_HOST, PROTOCOL_VERSION};
+use crate::config::{LOOPBACK_HOST, PROTOCOL_VERSION};
 use crate::error::{FwError, Result};
 #[cfg(test)]
 use crate::slug::normalize_slug;
@@ -160,11 +160,11 @@ pub struct RouteView {
 }
 
 impl RouteView {
-    pub fn new(slug: impl Into<String>, port: u16) -> Self {
+    pub fn new(slug: impl Into<String>, port: u16, base_domain: &str) -> Self {
         let slug = slug.into();
         Self {
             local_url: format!("http://{LOOPBACK_HOST}:{port}"),
-            public_url: format!("https://{slug}.{BASE_DOMAIN}"),
+            public_url: format!("https://{slug}.{base_domain}"),
             slug,
             port,
         }
@@ -259,8 +259,8 @@ mod tests {
 
     #[test]
     fn route_view_uses_configured_addresses() {
-        let route = RouteView::new("silent-panda", 4321);
+        let route = RouteView::new("silent-panda", 4321, "mytunnel.me");
         assert_eq!(route.local_url, "http://127.0.0.1:4321");
-        assert_eq!(route.public_url, "https://silent-panda.fw.rlzy.me");
+        assert_eq!(route.public_url, "https://silent-panda.mytunnel.me");
     }
 }

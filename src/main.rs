@@ -12,9 +12,11 @@ mod registry;
 mod slug;
 mod ui;
 
-use std::io;
-use std::process::ExitCode;
-use std::time::Instant;
+use std::io::{self, Read};
+use std::process::{ChildStderr, ExitCode, ExitStatus};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use tokio::net::windows::named_pipe::NamedPipeClient;
 
@@ -32,6 +34,8 @@ use ui::{
     write_info,
 };
 
+const MAX_DAEMON_STARTUP_ERROR_BYTES: usize = 64 * 1024;
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let invocation = match Cli::try_parse_normalized_from(std::env::args_os()) {
@@ -46,7 +50,9 @@ async fn main() -> ExitCode {
     match dispatch(invocation).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("error: {error}");
+            if !error.is_reported() {
+                eprintln!("error: {error}");
+            }
             ExitCode::FAILURE
         }
     }
@@ -124,8 +130,11 @@ async fn run_start(port: u16, slug: Option<String>) -> Result<()> {
     let (pipe, session_id, public_url) = match result {
         Ok(value) => value,
         Err(error) => {
-            let _ = progress.error(&error.to_string());
-            return Err(error);
+            return if progress.error(&error.to_string()).is_ok() {
+                Err(error.reported())
+            } else {
+                Err(error)
+            };
         }
     };
 
@@ -137,21 +146,70 @@ async fn start_and_connect(names: &UserObjectNames) -> Result<NamedPipeClient> {
     // Validate the exact sibling installation before creating any background
     // service process, preserving actionable path errors for the foreground.
     let paths = cloudflare_config::InstallPaths::resolve()?;
+    cloudflare_config::preflight_validate(&paths)?;
     let _startup_mutex = NamedMutex::acquire_startup(&names.startup_mutex)?;
     if let Ok(pipe) = windows::connect(&names.pipe) {
         return Ok(pipe);
     }
 
-    let _child = spawn_daemon(&paths.fw_executable)?;
+    let mut child = spawn_daemon(&paths.fw_executable)?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| FwError::Other("daemon stderr was not captured".into()))?;
+    let startup_error = capture_daemon_stderr(stderr);
     let deadline = Instant::now() + DAEMON_START_TIMEOUT;
     loop {
-        match windows::connect(&names.pipe) {
-            Ok(pipe) => return Ok(pipe),
-            Err(_) if Instant::now() < deadline => {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-            Err(_) => return Err(FwError::DaemonStartTimeout),
+        if let Ok(pipe) = windows::connect(&names.pipe) {
+            return Ok(pipe);
         }
+        if let Some(status) = child.try_wait()? {
+            return Err(daemon_exit_error(status, startup_error));
+        }
+        if Instant::now() >= deadline {
+            return Err(FwError::DaemonStartTimeout);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn capture_daemon_stderr(mut stderr: ChildStderr) -> Receiver<String> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            match stderr.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => {
+                    output.extend_from_slice(&chunk[..count]);
+                    if output.len() > MAX_DAEMON_STARTUP_ERROR_BYTES {
+                        let excess = output.len() - MAX_DAEMON_STARTUP_ERROR_BYTES;
+                        output.drain(..excess);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let output = String::from_utf8_lossy(&output).trim().to_owned();
+        let _ = sender.send(output);
+    });
+    receiver
+}
+
+fn daemon_exit_error(status: ExitStatus, startup_error: Receiver<String>) -> FwError {
+    let details = startup_error
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap_or_default();
+    FwError::DaemonExited {
+        code: status
+            .code()
+            .map_or_else(|| "unknown".into(), |code| code.to_string()),
+        details: if details.is_empty() {
+            "Unknown error".into()
+        } else {
+            details
+        },
     }
 }
 

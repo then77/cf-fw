@@ -59,6 +59,7 @@ pub trait RouteLookup: Send + Sync + 'static {
 #[derive(Clone)]
 struct Proxy {
     lookup: Arc<dyn RouteLookup>,
+    base_domain: Arc<str>,
     client: Client<HttpConnector, ProxyBody>,
 }
 
@@ -88,6 +89,7 @@ pub async fn reserve_listener() -> io::Result<TcpListener> {
 pub async fn serve(
     listener: TcpListener,
     lookup: Arc<dyn RouteLookup>,
+    base_domain: Arc<str>,
     shutdown: CancellationToken,
 ) -> io::Result<()> {
     let local_addr = listener.local_addr()?;
@@ -102,7 +104,11 @@ pub async fn serve(
     connector.enforce_http(true);
     connector.set_connect_timeout(Some(UPSTREAM_CONNECT_TIMEOUT));
     let client = Client::builder(TokioExecutor::new()).build(connector);
-    let proxy = Proxy { lookup, client };
+    let proxy = Proxy {
+        lookup,
+        base_domain,
+        client,
+    };
 
     loop {
         let (stream, peer) = tokio::select! {
@@ -137,7 +143,7 @@ pub async fn serve(
 
 impl Proxy {
     async fn forward(&self, mut request: Request<Incoming>) -> ProxyResponse {
-        let public_host = match headers::extract_public_host(&request) {
+        let public_host = match headers::extract_public_host(&request, &self.base_domain) {
             Some(host) => host,
             None => return generated_error(StatusCode::BAD_REQUEST, "Invalid host"),
         };

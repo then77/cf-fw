@@ -7,12 +7,18 @@ use serde_yml::{Mapping, Value};
 
 use crate::cloudflared;
 use crate::config::{
-    BASE_DOMAIN, CLOUDFLARE_CONFIG_FILENAME, CLOUDFLARE_DIRECTORY, CLOUDFLARED_FILENAME,
-    LOOPBACK_HOST,
+    CLOUDFLARE_CONFIG_FILENAME, CLOUDFLARE_DIRECTORY, CLOUDFLARED_FILENAME, LOOPBACK_HOST,
+    MIN_PROXY_PORT,
 };
 use crate::error::{FwError, Result};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NormalizedConfig {
+    pub yaml: String,
+    pub base_domain: String,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstallPaths {
@@ -54,13 +60,25 @@ impl InstallPaths {
     }
 }
 
+/// Checks the managed ingress contract without changing `config.yml`.
+pub fn preflight_validate(paths: &InstallPaths) -> Result<()> {
+    require_regular_file(CLOUDFLARED_FILENAME, &paths.cloudflared)?;
+    require_regular_file(CLOUDFLARE_CONFIG_FILENAME, &paths.cloudflare_config)?;
+    let input = fs::read_to_string(&paths.cloudflare_config)?;
+    normalize_yaml(&input, MIN_PROXY_PORT)?;
+    Ok(())
+}
+
 /// Normalizes, validates, and atomically installs the managed Cloudflare config.
 ///
 /// Both files in the sibling `cf` directory must already have been validated
 /// through [`InstallPaths`].
 /// The original config remains untouched unless the official validator accepts
 /// the complete temporary candidate.
-pub async fn normalize_validate_and_replace(paths: &InstallPaths, proxy_port: u16) -> Result<()> {
+pub async fn normalize_validate_and_replace(
+    paths: &InstallPaths,
+    proxy_port: u16,
+) -> Result<String> {
     // Recheck immediately before mutation in case installation files changed
     // after startup path resolution.
     require_regular_file(CLOUDFLARED_FILENAME, &paths.cloudflared)?;
@@ -68,27 +86,31 @@ pub async fn normalize_validate_and_replace(paths: &InstallPaths, proxy_port: u1
 
     let input = fs::read_to_string(&paths.cloudflare_config)?;
     let normalized = normalize_yaml(&input, proxy_port)?;
-    let mut candidate = TempCandidate::create(&paths.cloudflare_config, normalized.as_bytes())?;
+    let mut candidate =
+        TempCandidate::create(&paths.cloudflare_config, normalized.yaml.as_bytes())?;
 
     cloudflared::validate_config(&paths.cloudflared, candidate.path(), &paths.cloudflare_dir)
         .await?;
     atomic_replace(candidate.path(), &paths.cloudflare_config)?;
     candidate.disarm();
-    Ok(())
+    Ok(normalized.base_domain)
 }
 
-pub fn normalize_yaml(input: &str, proxy_port: u16) -> Result<String> {
-    let document: Value = serde_yml::from_str(input)?;
-    let normalized = normalize_value(document, proxy_port)?;
-    Ok(serde_yml::to_string(&normalized)?)
+pub fn normalize_yaml(input: &str, proxy_port: u16) -> Result<NormalizedConfig> {
+    let document: Value = serde_yml::from_str(input)
+        .map_err(|error| FwError::InvalidIngress(format!("Invalid YAML: {error}")))?;
+    let (normalized, base_domain) = normalize_value(document, proxy_port)?;
+    Ok(NormalizedConfig {
+        yaml: serde_yml::to_string(&normalized)?,
+        base_domain,
+    })
 }
 
-pub fn normalize_value(mut document: Value, proxy_port: u16) -> Result<Value> {
+pub fn normalize_value(mut document: Value, proxy_port: u16) -> Result<(Value, String)> {
     let root = document.as_mapping_mut().ok_or_else(|| {
         FwError::InvalidIngress("the YAML document must be a top-level mapping".into())
     })?;
 
-    let had_ingress = root.contains_key("ingress");
     let entries = match root.get_mut("ingress") {
         Some(Value::Sequence(entries)) => std::mem::take(entries),
         Some(_) => {
@@ -99,11 +121,10 @@ pub fn normalize_value(mut document: Value, proxy_port: u16) -> Result<Value> {
         None => Vec::new(),
     };
 
-    let canonical_hostname = format!("*.{BASE_DOMAIN}");
     let canonical_service = format!("http://{LOOPBACK_HOST}:{proxy_port}");
 
     let mut specific = Vec::with_capacity(entries.len());
-    let mut canonical = None;
+    let mut managed = None;
     let mut fallback = None;
 
     for (index, entry) in entries.into_iter().enumerate() {
@@ -115,19 +136,6 @@ pub fn normalize_value(mut document: Value, proxy_port: u16) -> Result<Value> {
                 )));
             }
         };
-
-        let has_path = rule.contains_key("path");
-        let hostname = rule.get("hostname").and_then(Value::as_str);
-        let is_canonical = !has_path
-            && hostname.is_some_and(|hostname| hostname.eq_ignore_ascii_case(&canonical_hostname));
-
-        if is_canonical {
-            if canonical.is_none() {
-                rule.insert("service", Value::String(canonical_service.clone()));
-                canonical = Some(rule);
-            }
-            continue;
-        }
 
         if !rule.contains_key("hostname") {
             let is_fallback = rule
@@ -145,26 +153,68 @@ pub fn normalize_value(mut document: Value, proxy_port: u16) -> Result<Value> {
             continue;
         }
 
+        let hostname = rule
+            .get("hostname")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if !rule.contains_key("path") {
+            if let Some(hostname) = hostname.as_deref() {
+                if let Some(base_domain) = wildcard_base_domain(hostname, index)? {
+                    if let Some((first_index, first_hostname, _)) = &managed {
+                        return Err(FwError::InvalidIngress(format!(
+                            "Ingress rules contain ambiguous multiple wildcard hostnames. Expected exactly one.\n\n\
+                             Detected ingress[{first_index}]: {first_hostname}\n\
+                             Detected ingress[{index}]: {hostname}\n\n\
+                             Please choose one as the intended FW wildcard hostname and remove the others."
+                        )));
+                    }
+                    rule.insert("service", Value::String(canonical_service.clone()));
+                    managed = Some((index, hostname.to_owned(), (rule, base_domain)));
+                    continue;
+                }
+            }
+        }
+
         specific.push(Value::Mapping(rule));
     }
 
-    let canonical = canonical.unwrap_or_else(|| {
-        mapping([
-            ("hostname", Value::String(canonical_hostname)),
-            ("service", Value::String(canonical_service)),
-        ])
-    });
+    let (_, _, (managed, base_domain)) = managed.ok_or_else(|| {
+        FwError::InvalidIngress(
+            "No pathless wildcard hostname was found. Expected exactly one rule such as \
+             `hostname: \"*.example.com\"`."
+                .into(),
+        )
+    })?;
     let fallback =
         fallback.unwrap_or_else(|| mapping([("service", Value::String("http_status:404".into()))]));
 
-    specific.push(Value::Mapping(canonical));
+    specific.push(Value::Mapping(managed));
     specific.push(Value::Mapping(fallback));
-    if had_ingress {
-        *root.get_mut("ingress").expect("existing ingress key") = Value::Sequence(specific);
-    } else {
-        root.insert("ingress", Value::Sequence(specific));
+    *root.get_mut("ingress").expect("wildcard requires ingress") = Value::Sequence(specific);
+    Ok((document, base_domain))
+}
+
+fn wildcard_base_domain(hostname: &str, index: usize) -> Result<Option<String>> {
+    let Some(domain) = hostname.strip_prefix("*.") else {
+        return Ok(None);
+    };
+    let domain = domain.to_ascii_lowercase();
+    let valid = !domain.is_empty()
+        && domain.len() <= 253
+        && domain.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        });
+    if !valid {
+        return Err(FwError::InvalidIngress(format!(
+            "Ingress[{index}] contains an invalid wildcard hostname `{hostname}`."
+        )));
     }
-    Ok(document)
+    Ok(Some(domain))
 }
 
 fn require_regular_file(name: &'static str, path: &Path) -> Result<()> {
@@ -272,7 +322,7 @@ mod tests {
     use super::*;
 
     fn parsed(input: &str, port: u16) -> Value {
-        serde_yml::from_str(&normalize_yaml(input, port).unwrap()).unwrap()
+        serde_yml::from_str(&normalize_yaml(input, port).unwrap().yaml).unwrap()
     }
 
     fn ingress(value: &Value) -> &[Value] {
@@ -345,24 +395,31 @@ ingress:
     #[test]
     fn preserves_top_level_key_order() {
         let normalized = normalize_yaml(
-            "first: 1\ningress:\n  - service: http_status:404\nlast: 2\n",
+            "first: 1\ningress:\n  - hostname: '*.example.com'\n    service: old\n  - service: http_status:404\nlast: 2\n",
             10000,
         )
         .unwrap();
-        let first = normalized.find("first:").unwrap();
-        let ingress = normalized.find("ingress:").unwrap();
-        let last = normalized.find("last:").unwrap();
+        let first = normalized.yaml.find("first:").unwrap();
+        let ingress = normalized.yaml.find("ingress:").unwrap();
+        let last = normalized.yaml.find("last:").unwrap();
         assert!(first < ingress && ingress < last);
     }
 
     #[test]
-    fn creates_missing_ingress() {
-        let value = parsed("tunnel: abc\ncredentials-file: credentials.json\n", 10000);
+    fn detects_domain_and_creates_missing_fallback() {
+        let normalized = normalize_yaml(
+            "ingress:\n  - hostname: '*.MYTUNNEL.ME'\n    service: old\n",
+            10000,
+        )
+        .unwrap();
+        assert_eq!(normalized.base_domain, "mytunnel.me");
+
+        let value: Value = serde_yml::from_str(&normalized.yaml).unwrap();
         let rules = ingress(&value);
         assert_eq!(rules.len(), 2);
         assert_eq!(
             field(&rules[0], "hostname").unwrap().as_str(),
-            Some("*.fw.rlzy.me")
+            Some("*.MYTUNNEL.ME")
         );
         assert_eq!(
             field(&rules[0], "service").unwrap().as_str(),
@@ -375,32 +432,22 @@ ingress:
     }
 
     #[test]
-    fn deduplicates_owned_wildcard_and_fallback() {
-        let value = parsed(
+    fn rejects_multiple_wildcard_hostnames() {
+        let error = normalize_yaml(
             r#"
 ingress:
   - hostname: '*.fw.rlzy.me'
     service: first
-    keep: yes
-  - service: http_status:404
-    keep-fallback: yes
-  - hostname: '*.fw.rlzy.me'
+  - hostname: '*.mytunnel.me'
     service: second
-    discard: yes
-  - service: http_status:404
-    discard-fallback: yes
 "#,
             23456,
-        );
-        let rules = ingress(&value);
-        assert_eq!(rules.len(), 2);
-        assert_eq!(field(&rules[0], "keep").unwrap().as_str(), Some("yes"));
-        assert!(field(&rules[0], "discard").is_none());
-        assert_eq!(
-            field(&rules[1], "keep-fallback").unwrap().as_str(),
-            Some("yes")
-        );
-        assert!(field(&rules[1], "discard-fallback").is_none());
+        )
+        .unwrap_err();
+        assert!(matches!(error, FwError::InvalidIngress(message)
+            if message.contains("ambiguous multiple wildcard hostnames")
+                && message.contains("Detected ingress[0]: *.fw.rlzy.me")
+                && message.contains("Detected ingress[1]: *.mytunnel.me")));
     }
 
     #[test]
@@ -411,6 +458,8 @@ ingress:
   - hostname: '*.fw.rlzy.me'
     path: /api/*
     service: http://127.0.0.1:9000
+  - hostname: '*.mytunnel.me'
+    service: old
 "#,
             34567,
         );
@@ -425,6 +474,28 @@ ingress:
             field(&rules[1], "service").unwrap().as_str(),
             Some("http://127.0.0.1:34567")
         );
+    }
+
+    #[test]
+    fn rejects_missing_wildcard_hostname() {
+        let error = normalize_yaml(
+            "ingress:\n  - hostname: apple-cat.example.com\n    service: local\n  - service: http_status:404\n",
+            10000,
+        )
+        .unwrap_err();
+        assert!(matches!(error, FwError::InvalidIngress(message)
+            if message.contains("No pathless wildcard hostname")));
+    }
+
+    #[test]
+    fn rejects_invalid_wildcard_hostname() {
+        let error = normalize_yaml(
+            "ingress:\n  - hostname: '*.*.example.com'\n    service: local\n",
+            10000,
+        )
+        .unwrap_err();
+        assert!(matches!(error, FwError::InvalidIngress(message)
+            if message.contains("invalid wildcard hostname")));
     }
 
     #[test]

@@ -37,11 +37,12 @@ struct Shared {
     next_session: Arc<AtomicU64>,
     shutting_down: Arc<AtomicBool>,
     idle_since: Arc<Mutex<Option<Instant>>>,
+    base_domain: Arc<str>,
     shutdown: CancellationToken,
 }
 
 impl Shared {
-    fn new(shutdown: CancellationToken) -> Self {
+    fn new(shutdown: CancellationToken, base_domain: Arc<str>) -> Self {
         Self {
             registry: Arc::new(RwLock::new(RouteRegistry::new())),
             owners: Arc::new(RwLock::new(HashMap::new())),
@@ -49,6 +50,7 @@ impl Shared {
             next_session: Arc::new(AtomicU64::new(1)),
             shutting_down: Arc::new(AtomicBool::new(false)),
             idle_since: Arc::new(Mutex::new(None)),
+            base_domain,
             shutdown,
         }
     }
@@ -96,18 +98,21 @@ pub async fn run() -> Result<()> {
             _ => error.into(),
         })?;
     let proxy_port = listener.local_addr()?.port();
-    cloudflare_config::normalize_validate_and_replace(&paths, proxy_port).await?;
+    let base_domain: Arc<str> =
+        cloudflare_config::normalize_validate_and_replace(&paths, proxy_port)
+            .await?
+            .into();
 
     let pipe_listener = PipeListener::new(names.pipe);
     let first_pipe = pipe_listener.create_first_instance()?;
 
     let root = CancellationToken::new();
-    let shared = Shared::new(root.clone());
+    let shared = Shared::new(root.clone(), base_domain.clone());
     let lookup = Arc::new(RegistryLookup {
         registry: shared.registry.clone(),
     });
     let proxy_shutdown = root.child_token();
-    let proxy_task = tokio::spawn(proxy::serve(listener, lookup, proxy_shutdown));
+    let proxy_task = tokio::spawn(proxy::serve(listener, lookup, base_domain, proxy_shutdown));
 
     let mut cloudflared = match CloudflaredProcess::spawn(
         &paths.cloudflared,
@@ -253,7 +258,7 @@ where
                             .await
                             .insert(session_id, outgoing.clone());
                         shared.mark_active().await;
-                        let view = route.view();
+                        let view = route.view(&shared.base_domain);
                         send_response(
                             &outgoing,
                             request_id,
@@ -301,7 +306,7 @@ where
                 }
             }
             ClientMessage::List => {
-                let routes = shared.registry.read().await.list();
+                let routes = shared.registry.read().await.list(&shared.base_domain);
                 send_response(&outgoing, request_id, ServerMessage::RouteList { routes }).await?;
             }
             ClientMessage::Stop { selector } => {
@@ -368,7 +373,7 @@ async fn stop_route(
         outgoing,
         request_id,
         ServerMessage::Stopped {
-            route: route.view(),
+            route: route.view(&shared.base_domain),
         },
     )
     .await

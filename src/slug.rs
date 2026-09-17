@@ -6,21 +6,21 @@ pub const MAX_SLUG_LEN: usize = 63;
 pub const GENERATED_SLUG_RANDOM_ATTEMPTS: usize = 32;
 
 pub const ADJECTIVES: &[&str] = &[
-    "amber", "apple", "azure", "bold", "bright", "brisk", "calm", "clear", "cool", "cozy",
-    "crisp", "dawn", "deep", "eager", "fair", "fast", "fresh", "gentle", "golden", "green",
-    "happy", "kind", "light", "lively", "lucky", "mellow", "merry", "misty", "neat", "noble",
-    "orange", "peaceful", "pink", "plain", "proud", "pure", "quick", "quiet", "rapid", "red",
-    "rosy", "safe", "sharp", "silent", "silver", "small", "soft", "solar", "still", "sunny",
-    "sweet", "swift", "tiny", "true", "vivid", "warm", "white", "wild", "wise", "young",
+    "amber", "apple", "azure", "bold", "bright", "brisk", "calm", "clear", "cool", "cozy", "crisp",
+    "dawn", "deep", "eager", "fair", "fast", "fresh", "gentle", "golden", "green", "happy", "kind",
+    "light", "lively", "lucky", "mellow", "merry", "misty", "neat", "noble", "orange", "peaceful",
+    "pink", "plain", "proud", "pure", "quick", "quiet", "rapid", "red", "rosy", "safe", "sharp",
+    "silent", "silver", "small", "soft", "solar", "still", "sunny", "sweet", "swift", "tiny",
+    "true", "vivid", "warm", "white", "wild", "wise", "young",
 ];
 
 pub const NOUNS: &[&str] = &[
-    "badger", "bay", "bear", "birch", "brook", "cedar", "cloud", "comet", "coral", "cove",
-    "crane", "dawn", "deer", "dove", "eagle", "falcon", "fern", "field", "finch", "forest",
-    "fox", "grove", "harbor", "hawk", "hill", "island", "lake", "leaf", "lynx", "maple",
-    "meadow", "moon", "oak", "ocean", "orbit", "otter", "owl", "panda", "peak", "pebble",
-    "pen", "pine", "pond", "rain", "reef", "river", "robin", "sparrow", "star", "stone",
-    "storm", "sun", "tiger", "trail", "valley", "wave", "willow", "wolf", "wood", "wren",
+    "badger", "bay", "bear", "birch", "brook", "cedar", "cloud", "comet", "coral", "cove", "crane",
+    "dawn", "deer", "dove", "eagle", "falcon", "fern", "field", "finch", "forest", "fox", "grove",
+    "harbor", "hawk", "hill", "island", "lake", "leaf", "lynx", "maple", "meadow", "moon", "oak",
+    "ocean", "orbit", "otter", "owl", "panda", "peak", "pebble", "pen", "pine", "pond", "rain",
+    "reef", "river", "robin", "sparrow", "star", "stone", "storm", "sun", "tiger", "trail",
+    "valley", "wave", "willow", "wolf", "wood", "wren",
 ];
 
 /// Normalize a user-provided slug to lowercase and validate it as a DNS label.

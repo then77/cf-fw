@@ -368,7 +368,7 @@ mod tests {
     #[test]
     fn command_arguments_match_cloudflared_contract() {
         let executable = Path::new(r"C:\FW\cf\cloudflared.exe");
-        let config = Path::new(r"C:\FW\cf\cf-config.yml");
+        let config = Path::new(r"C:\FW\cf\config.yml");
         let cloudflare_dir = Path::new(r"C:\FW\cf");
 
         let validation = validation_command(executable, config, cloudflare_dir)
@@ -381,7 +381,7 @@ mod tests {
             [
                 "tunnel",
                 "--config",
-                r"C:\FW\cf\cf-config.yml",
+                r"C:\FW\cf\config.yml",
                 "ingress",
                 "validate"
             ]
@@ -395,7 +395,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             run,
-            ["tunnel", "--config", r"C:\FW\cf\cf-config.yml", "run"].map(OsString::from)
+            ["tunnel", "--config", r"C:\FW\cf\config.yml", "run"].map(OsString::from)
         );
     }
 }
