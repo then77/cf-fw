@@ -6,11 +6,12 @@ pub mod upgrade;
 use std::{
     convert::Infallible,
     error::Error,
-    future::Future,
+    future::{Future, Ready, ready},
     io,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
 };
 
 use bytes::Bytes;
@@ -18,13 +19,17 @@ use http::{Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
 use hyper::{body::Incoming, service::service_fn};
 use hyper_util::{
-    client::legacy::{Client, connect::HttpConnector},
+    client::legacy::{
+        Client,
+        connect::{HttpConnector, dns::Name},
+    },
     rt::{TokioExecutor, TokioIo},
     server::conn::auto,
 };
 use rand::seq::SliceRandom;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
+use tower_service::Service;
 
 use crate::config::{
     MAX_PROXY_PORT, MIN_PROXY_PORT, UPSTREAM_CONNECT_TIMEOUT, UPSTREAM_HEADER_TIMEOUT,
@@ -56,11 +61,36 @@ pub trait RouteLookup: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Option<ProxyRoute>> + Send + 'a>>;
 }
 
+#[derive(Clone, Debug)]
+struct LoopbackResolver;
+
+impl Service<Name> for LoopbackResolver {
+    type Response = std::array::IntoIter<SocketAddr, 2>;
+    type Error = Infallible;
+    type Future = Ready<Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, name: Name) -> Self::Future {
+        debug_assert_eq!(name.as_str(), "localhost");
+        ready(Ok(loopback_addresses().into_iter()))
+    }
+}
+
+fn loopback_addresses() -> [SocketAddr; 2] {
+    [
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        SocketAddr::from((Ipv6Addr::LOCALHOST, 0)),
+    ]
+}
+
 #[derive(Clone)]
 struct Proxy {
     lookup: Arc<dyn RouteLookup>,
     base_domain: Arc<str>,
-    client: Client<HttpConnector, ProxyBody>,
+    client: Client<HttpConnector<LoopbackResolver>, ProxyBody>,
 }
 
 /// Bind and retain the real proxy listener, eliminating the allocation race that
@@ -100,7 +130,7 @@ pub async fn serve(
         ));
     }
 
-    let mut connector = HttpConnector::new();
+    let mut connector = HttpConnector::new_with_resolver(LoopbackResolver);
     connector.enforce_http(true);
     connector.set_connect_timeout(Some(UPSTREAM_CONNECT_TIMEOUT));
     let client = Client::builder(TokioExecutor::new()).build(connector);
@@ -266,8 +296,15 @@ fn error_is_timeout(error: &(dyn Error + 'static)) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{FALLBACK_HEADER, FALLBACK_HEADER_VALUE, generated_error};
+    use super::{FALLBACK_HEADER, FALLBACK_HEADER_VALUE, generated_error, loopback_addresses};
     use http::StatusCode;
+
+    #[test]
+    fn loopback_resolution_prefers_ipv4_then_ipv6() {
+        let addresses = loopback_addresses();
+        assert_eq!(addresses[0], "127.0.0.1:0".parse().unwrap());
+        assert_eq!(addresses[1], "[::1]:0".parse().unwrap());
+    }
 
     #[test]
     fn generated_proxy_errors_are_marked_as_fw_fallbacks() {

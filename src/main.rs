@@ -9,6 +9,7 @@ mod metrics;
 mod platform;
 mod proxy;
 mod registry;
+mod setup;
 mod slug;
 mod ui;
 
@@ -70,6 +71,7 @@ fn init_tracing() {
 async fn dispatch(invocation: Invocation) -> Result<()> {
     match invocation {
         Invocation::Daemon => daemon::run().await,
+        Invocation::Setup => setup::run().await,
         Invocation::Start { port, slug } => run_start(port, slug).await,
         Invocation::List => run_list().await,
         Invocation::Stop { selector } => {

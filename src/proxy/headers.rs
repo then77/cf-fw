@@ -31,16 +31,17 @@ pub fn rewrite_for_upstream<B>(
         .path_and_query()
         .cloned()
         .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/"));
-    let authority = format!("127.0.0.1:{}", target.port());
+    let connector_authority = format!("localhost:{}", target.port());
+    let upstream_authority = format!("127.0.0.1:{}", target.port());
 
     *request.uri_mut() = Uri::builder()
         .scheme("http")
-        .authority(authority.as_str())
+        .authority(connector_authority.as_str())
         .path_and_query(path_and_query)
         .build()?;
 
     let headers = request.headers_mut();
-    headers.insert(header::HOST, HeaderValue::from_str(&authority)?);
+    headers.insert(header::HOST, HeaderValue::from_str(&upstream_authority)?);
     headers.insert("x-forwarded-host", HeaderValue::from_str(public_hostname)?);
     headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
     Ok(())
@@ -83,9 +84,34 @@ fn valid_slug(slug: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{Ipv4Addr, SocketAddr};
+
     use http::{Request, header};
 
-    use super::extract_public_host;
+    use super::{extract_public_host, rewrite_for_upstream};
+
+    #[test]
+    fn rewrites_for_dual_stack_loopback_resolution() {
+        let mut request = Request::builder()
+            .uri("/api?value=1")
+            .header(header::HOST, "route.example.com")
+            .body(())
+            .unwrap();
+
+        rewrite_for_upstream(
+            &mut request,
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 4321)),
+            "route.example.com",
+        )
+        .unwrap();
+
+        assert_eq!(
+            request.uri().to_string(),
+            "http://localhost:4321/api?value=1"
+        );
+        assert_eq!(request.headers()[header::HOST], "127.0.0.1:4321");
+        assert_eq!(request.headers()["x-forwarded-host"], "route.example.com");
+    }
 
     #[test]
     fn extracts_slug_from_host_with_optional_port() {

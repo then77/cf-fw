@@ -11,6 +11,7 @@ use crate::config::{
     MIN_PROXY_PORT,
 };
 use crate::error::{FwError, Result};
+use crate::platform::executable_directory_from;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -31,18 +32,11 @@ pub struct InstallPaths {
 
 impl InstallPaths {
     pub fn resolve() -> Result<Self> {
-        Self::from_executable(std::env::current_exe()?)
+        Self::from_executable(crate::platform::executable_path()?)
     }
 
     pub fn from_executable(fw_executable: PathBuf) -> Result<Self> {
-        if !fw_executable.is_absolute() {
-            return Err(FwError::InvalidExecutableDirectory);
-        }
-        let install_dir = fw_executable
-            .parent()
-            .filter(|parent| parent.is_absolute())
-            .ok_or(FwError::InvalidExecutableDirectory)?
-            .to_path_buf();
+        let install_dir = executable_directory_from(&fw_executable)?;
         let cloudflare_dir = install_dir.join(CLOUDFLARE_DIRECTORY);
         let cloudflared = cloudflare_dir.join(CLOUDFLARED_FILENAME);
         let cloudflare_config = cloudflare_dir.join(CLOUDFLARE_CONFIG_FILENAME);

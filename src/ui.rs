@@ -57,13 +57,16 @@ pub struct StartupProgress {
 
 impl StartupProgress {
     pub fn new(mode: StartupMode) -> Self {
-        Self::with_interactivity(mode, io::stdout().is_terminal())
+        Self::with_message(mode.message(), io::stdout().is_terminal())
     }
 
-    /// Explicit interactivity is useful for deterministic integration tests.
-    pub fn with_interactivity(mode: StartupMode, interactive: bool) -> Self {
+    pub fn for_message(message: &'static str) -> Self {
+        Self::with_message(message, io::stdout().is_terminal())
+    }
+
+    fn with_message(message: &'static str, interactive: bool) -> Self {
         if !interactive {
-            println!("⠷ {}", mode.message());
+            println!("⠷ {message}");
             return Self { spinner: None };
         }
 
@@ -74,7 +77,7 @@ impl StartupProgress {
                 .expect("the static spinner template is valid")
                 .tick_strings(BRAILLE_TICKS),
         );
-        spinner.set_message(mode.message());
+        spinner.set_message(message);
         spinner.enable_steady_tick(SPINNER_TICK);
 
         Self {

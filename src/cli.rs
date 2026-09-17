@@ -19,6 +19,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub daemon: bool,
 
+    /// Download, verify, and run the setup script.
+    #[arg(long, global = true)]
+    pub setup: bool,
+
     /// Custom public slug. Used only when starting a forward.
     #[arg(short, long, global = true)]
     pub slug: Option<String>,
@@ -51,6 +55,7 @@ pub enum Command {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Invocation {
     Daemon,
+    Setup,
     Start { port: u16, slug: Option<String> },
     List,
     Stop { selector: StopSelector },
@@ -68,6 +73,8 @@ pub enum StopSelector {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
     DaemonWithCommand,
+    SetupWithCommand,
+    ConflictingModes,
     ShorthandWithSubcommand,
     SlugWithoutStart,
     MissingCommand,
@@ -81,6 +88,10 @@ impl fmt::Display for ValidationError {
             Self::DaemonWithCommand => {
                 f.write_str("--daemon cannot be combined with a port or subcommand")
             }
+            Self::SetupWithCommand => {
+                f.write_str("--setup cannot be combined with a port or subcommand")
+            }
+            Self::ConflictingModes => f.write_str("--setup and --daemon cannot be used together"),
             Self::ShorthandWithSubcommand => {
                 f.write_str("a shorthand port cannot be combined with a subcommand")
             }
@@ -111,6 +122,10 @@ impl Cli {
 
     /// Convert raw arguments into one normalized dispatch value.
     pub fn normalize(self) -> Result<Invocation, ValidationError> {
+        if self.daemon && self.setup {
+            return Err(ValidationError::ConflictingModes);
+        }
+
         if self.daemon {
             if self.port.is_some() || self.command.is_some() {
                 return Err(ValidationError::DaemonWithCommand);
@@ -119,6 +134,15 @@ impl Cli {
             // Recognized non-command options are intentionally ignored in pure
             // daemon mode. Unknown options have already been rejected by Clap.
             return Ok(Invocation::Daemon);
+        }
+
+        if self.setup {
+            if self.port.is_some() || self.command.is_some() {
+                return Err(ValidationError::SetupWithCommand);
+            }
+
+            // As in daemon mode, recognized non-command options are ignored.
+            return Ok(Invocation::Setup);
         }
 
         if self.port.is_some() && self.command.is_some() {
@@ -238,6 +262,8 @@ fn invalid_slug(value: &str, reason: &'static str) -> ValidationError {
 fn clap_error(error: ValidationError) -> clap::Error {
     let kind = match error {
         ValidationError::DaemonWithCommand
+        | ValidationError::SetupWithCommand
+        | ValidationError::ConflictingModes
         | ValidationError::ShorthandWithSubcommand
         | ValidationError::SlugWithoutStart => ErrorKind::ArgumentConflict,
         ValidationError::MissingCommand => ErrorKind::MissingSubcommand,
@@ -338,6 +364,33 @@ mod tests {
     fn unknown_daemon_option_is_still_rejected_by_clap() {
         let error = parse(&["fw", "--daemon", "--unknown"]).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn setup_matches_daemon_validation_and_ignores_slug() {
+        assert_eq!(parse(&["fw", "--setup"]).unwrap(), Invocation::Setup);
+        assert_eq!(
+            parse(&["fw", "--slug", "ignored", "--setup"]).unwrap(),
+            Invocation::Setup
+        );
+
+        for args in [
+            &["fw", "8080", "--setup"][..],
+            &["fw", "start", "8080", "--setup"],
+            &["fw", "list", "--setup"],
+            &["fw", "stop", "apple-pen", "--setup"],
+            &["fw", "kill", "--setup"],
+        ] {
+            let error = parse(args).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::ArgumentConflict, "{args:?}");
+            assert!(error.to_string().contains("--setup cannot be combined"));
+        }
+    }
+
+    #[test]
+    fn setup_and_daemon_are_mutually_exclusive() {
+        let error = parse(&["fw", "--setup", "--daemon"]).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
     }
 
     #[test]
