@@ -579,7 +579,7 @@ mod tests {
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             loop {
-                if fs::read_to_string(&received).as_deref() == Ok("received") {
+                if matches!(fs::read_to_string(&received), Ok(content) if content == "received") {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;

@@ -305,6 +305,7 @@ jobs:
                   retention-days: 3
 
     test-macos:
+        if: false # Temporarily disabled after ARM64 runner images repeatedly became unresponsive.
         name: Test macOS ${{ matrix.arch }}
         runs-on: ${{ matrix.runner }}
         permissions:

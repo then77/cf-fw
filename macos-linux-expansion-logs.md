@@ -43,6 +43,16 @@ This file records checkpoints, skipped procedures, and validation limits for wor
 - Local validation passed: `sh -n`, embedded setup self-test, workflow/file diagnostics, formatting, all 100 Windows GNU tests, and the Windows GNU release build/check.
 - Native Unix compilation, process-group tests, archive execution, runner-label availability, and final workflow aggregation still require the next GitHub Actions dry run with `publish=no`.
 
+## 2026-09-18 — Focused ARM runner diagnostics
+
+- Dry-run workflow `35369954169` used `version=0.1.7` and `publish=no`; Windows and Intel macOS were temporarily disabled to isolate Linux and Apple Silicon macOS.
+- Linux AMD64 passed all 115 tests. Linux ARM64 exposed a race in the descendant signal proof file: file creation could be observed before its contents were fully written. The bounded wait was changed to require the completed marker contents.
+- The `macos-15-arm64` job remained unresponsive and the workflow was canceled after more than four minutes without useful job output.
+- Dry-run workflow `35370602943` used `version=0.1.8` and `publish=no`. Its Linux jobs found a Unix-only compile mistake in the new polling predicate before any test executed; this was corrected with a guarded `matches!` expression.
+- The `macos-26-arm64` job also remained unresponsive and the workflow was canceled after nearly seven minutes without useful job output. Earlier attempts on `macos-14-arm64` and `macos-15-arm64` had the same infrastructure behavior, although `macos-14-arm64` successfully ran the full native suite in workflow `35358179535`.
+- Apple Silicon macOS jobs are temporarily skipped after exhausting the available GitHub-hosted ARM runner image labels. This is an infrastructure availability limit, not a source or test failure; Linux validation continues independently.
+
 ## Skipped or deferred procedures
 
 - Live Cloudflare OAuth/API/tunnel testing remains intentionally deferred to manual testing; automated tests exercise pure setup logic and packaging without creating real Cloudflare resources.
+- Additional Apple Silicon macOS CI runs are deferred until GitHub-hosted ARM runners become responsive again.
