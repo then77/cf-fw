@@ -3,6 +3,11 @@ use std::fmt;
 
 use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
 
+const APP_VERSION: &str = match option_env!("FW_APP_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 /// Raw command-line arguments accepted by `fw`.
 ///
 /// Call [`Cli::normalize`] (or [`Cli::try_parse_normalized_from`]) before
@@ -11,7 +16,7 @@ use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
 #[derive(Debug, Clone, PartialEq, Eq, Parser)]
 #[command(
     name = "fw",
-    version,
+    version = APP_VERSION,
     about = "Forward local HTTP services through Cloudflare"
 )]
 pub struct Cli {
@@ -282,6 +287,11 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Invocation, clap::Error> {
         Cli::try_parse_normalized_from(args)
+    }
+
+    #[test]
+    fn reports_the_embedded_application_version() {
+        assert_eq!(Cli::command().get_version(), Some(APP_VERSION));
     }
 
     #[test]
