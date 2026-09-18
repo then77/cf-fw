@@ -549,37 +549,35 @@ mod tests {
 
     #[tokio::test]
     async fn process_group_shutdown_reaches_descendants() {
-        use tokio::io::{AsyncBufReadExt, BufReader};
-
+        let directory = TestDirectory::new();
+        let ready = directory.path().join("ready");
+        let received = directory.path().join("received");
         let mut command = TokioCommand::new("/bin/sh");
         command
             .arg("-c")
-            .arg("(trap 'exit 0' TERM INT; while :; do sleep 1; done) & child=$!; echo $child; wait $child")
+            .arg("(trap 'printf received > \"$FW_SIGNAL_RECEIVED\"; exit 0' TERM INT; printf ready > \"$FW_SIGNAL_READY\"; while :; do sleep 1; done) & child=$!; wait $child")
+            .env("FW_SIGNAL_READY", &ready)
+            .env("FW_SIGNAL_RECEIVED", &received)
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
+            .stdout(Stdio::null())
             .stderr(Stdio::null());
         let mut supervisor = ChildSupervisor::prepare(&mut command).unwrap();
         let mut child = command.spawn().unwrap();
         supervisor.attach(&child).unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let mut lines = BufReader::new(stdout).lines();
-        let descendant: libc::pid_t = lines
-            .next_line()
-            .await
-            .unwrap()
-            .expect("helper did not report descendant PID")
-            .parse()
-            .unwrap();
 
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !ready.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("descendant did not become ready");
         supervisor.begin_shutdown().unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(3), child.wait())
             .await
             .expect("process group ignored SIGTERM")
             .unwrap();
 
-        // SAFETY: signal 0 performs existence/permission checking only.
-        let result = unsafe { libc::kill(descendant, 0) };
-        assert_eq!(result, -1);
-        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        assert_eq!(fs::read_to_string(received).unwrap(), "received");
     }
 }
