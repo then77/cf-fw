@@ -126,8 +126,8 @@ mod tests {
         assert!(server.is_ok());
     }
 
-    #[test]
-    fn socket_is_private_and_removed_on_drop() {
+    #[tokio::test]
+    async fn socket_is_private_and_removed_on_drop() {
         let path = temporary_path("permissions");
         let listener = Listener::bind(&path).unwrap();
         assert_eq!(
@@ -138,8 +138,8 @@ mod tests {
         assert!(!path.exists());
     }
 
-    #[test]
-    fn stale_socket_is_recovered() {
+    #[tokio::test]
+    async fn stale_socket_is_recovered() {
         let path = temporary_path("stale");
         let stale = std::os::unix::net::UnixListener::bind(&path).unwrap();
         drop(stale);
@@ -148,8 +148,8 @@ mod tests {
         assert!(!path.exists());
     }
 
-    #[test]
-    fn active_socket_is_not_replaced() {
+    #[tokio::test]
+    async fn active_socket_is_not_replaced() {
         let path = temporary_path("active");
         let listener = Listener::bind(&path).unwrap();
         let error = Listener::bind(&path).unwrap_err();

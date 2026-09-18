@@ -227,7 +227,7 @@ pub fn spawn_daemon(executable: &Path) -> Result<Child> {
         command.pre_exec(|| {
             // SAFETY: setsid takes no pointers or arguments. In the post-fork
             // child it either creates a new session or returns -1 with errno set.
-            if unsafe { libc::setsid() } == -1 {
+            if libc::setsid() == -1 {
                 Err(io::Error::last_os_error())
             } else {
                 Ok(())

@@ -216,7 +216,9 @@ pub async fn validate_config(
     require_absolute(candidate_config, "temporary cloudflared configuration")?;
     require_absolute(install_dir, "installation directory")?;
 
-    let mut command = validation_command(executable, candidate_config, install_dir);
+    let command = validation_command(executable, candidate_config, install_dir);
+    #[cfg(windows)]
+    let mut command = command;
     #[cfg(windows)]
     configure_no_window(&mut command);
     let (status, output) = run_bounded(command).await?;
