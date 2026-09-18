@@ -24,3 +24,11 @@ pub(crate) fn executable_directory_from(executable: &Path) -> Result<PathBuf> {
         .map(Path::to_path_buf)
         .ok_or(FwError::InvalidExecutableDirectory)
 }
+
+pub(crate) fn executable_name_from(executable: &Path) -> Result<String> {
+    executable
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_string_lossy().into_owned())
+        .ok_or(FwError::InvalidExecutableDirectory)
+}

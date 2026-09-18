@@ -36,6 +36,7 @@ const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UserObjectNames {
     pub sid_hash: String,
+    pub directory_hash: String,
     pub daemon_mutex: String,
     pub startup_mutex: String,
     pub pipe: String,
@@ -44,25 +45,44 @@ pub struct UserObjectNames {
 impl UserObjectNames {
     pub fn current() -> Result<Self> {
         let sid_hash = current_user_sid_hash()?;
-        Ok(Self::from_sid_hash(sid_hash))
+        let executable = crate::platform::executable_path()?;
+        let directory_hash = installation_directory_hash(&executable)?;
+        Ok(Self::from_hashes(sid_hash, directory_hash))
     }
 
-    fn from_sid_hash(sid_hash: String) -> Self {
+    fn from_hashes(sid_hash: String, directory_hash: String) -> Self {
         Self {
-            daemon_mutex: format!(r"Local\fw-daemon-{sid_hash}"),
-            startup_mutex: format!(r"Local\fw-start-{sid_hash}"),
-            pipe: format!(r"\\.\pipe\fw-{sid_hash}"),
+            daemon_mutex: format!(r"Local\fw-daemon-{sid_hash}-{directory_hash}"),
+            startup_mutex: format!(r"Local\fw-start-{sid_hash}-{directory_hash}"),
+            pipe: format!(r"\\.\pipe\fw-{sid_hash}-{directory_hash}"),
             sid_hash,
+            directory_hash,
         }
     }
 }
 
 pub fn current_user_sid_hash() -> Result<String> {
     let sid = current_user_sid_bytes()?;
-    let hash = sid.iter().fold(FNV_OFFSET_BASIS, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+    Ok(fnv1a_hex(sid.iter().copied()))
+}
+
+fn installation_directory_hash(executable: &Path) -> Result<String> {
+    let directory = crate::platform::executable_directory_from(executable)?;
+    let normalized = directory
+        .as_os_str()
+        .to_string_lossy()
+        .replace('/', r"\")
+        .to_lowercase();
+    Ok(fnv1a_hex(
+        normalized.encode_utf16().flat_map(u16::to_le_bytes),
+    ))
+}
+
+fn fnv1a_hex(bytes: impl IntoIterator<Item = u8>) -> String {
+    let hash = bytes.into_iter().fold(FNV_OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
     });
-    Ok(format!("{hash:016x}"))
+    format!("{hash:016x}")
 }
 
 fn current_user_sid_bytes() -> Result<Vec<u8>> {
@@ -310,10 +330,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn object_names_are_local_and_pipe_safe() {
-        let names = UserObjectNames::from_sid_hash("0123456789abcdef".into());
-        assert_eq!(names.daemon_mutex, r"Local\fw-daemon-0123456789abcdef");
-        assert_eq!(names.startup_mutex, r"Local\fw-start-0123456789abcdef");
-        assert_eq!(names.pipe, r"\\.\pipe\fw-0123456789abcdef");
+    fn object_names_are_scoped_to_the_user_and_executable() {
+        let names =
+            UserObjectNames::from_hashes("0123456789abcdef".into(), "fedcba9876543210".into());
+        assert_eq!(names.sid_hash, "0123456789abcdef");
+        assert_eq!(names.directory_hash, "fedcba9876543210");
+        assert_eq!(
+            names.daemon_mutex,
+            r"Local\fw-daemon-0123456789abcdef-fedcba9876543210"
+        );
+        assert_eq!(
+            names.startup_mutex,
+            r"Local\fw-start-0123456789abcdef-fedcba9876543210"
+        );
+        assert_eq!(names.pipe, r"\\.\pipe\fw-0123456789abcdef-fedcba9876543210");
+    }
+
+    #[test]
+    fn directory_hash_is_case_and_separator_insensitive() {
+        let first = installation_directory_hash(Path::new(r"C:\Tools\FW\fw.exe")).unwrap();
+        let second = installation_directory_hash(Path::new("c:/tools/fw/FW.EXE")).unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn directory_hash_ignores_the_executable_filename() {
+        let first = installation_directory_hash(Path::new(r"C:\Tools\FW\fw.exe")).unwrap();
+        let second = installation_directory_hash(Path::new(r"C:\Tools\FW\renamed-fw.exe")).unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn directory_hash_distinguishes_different_installations() {
+        let first = installation_directory_hash(Path::new(r"C:\Tools\First\fw.exe")).unwrap();
+        let second = installation_directory_hash(Path::new(r"C:\Tools\Second\fw.exe")).unwrap();
+        assert_ne!(first, second);
     }
 }

@@ -1,0 +1,198 @@
+name: Release
+
+on:
+    workflow_dispatch:
+        inputs:
+            version:
+                description: "Release/app version, ex: 0.1.0"
+                required: true
+                type: string
+
+concurrency:
+    group: release-${{ inputs.version }}
+    cancel-in-progress: false
+
+jobs:
+    build-windows:
+        name: Build Windows binaries
+        runs-on: windows-latest
+        permissions:
+            contents: read
+
+        steps:
+            - name: Checkout selected revision
+              uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+              with:
+                  ref: ${{ github.sha }}
+                  persist-credentials: false
+
+            - name: Validate Windows release inputs and setup script
+              id: metadata
+              shell: pwsh
+              env:
+                  RELEASE_VERSION: ${{ inputs.version }}
+              run: |
+                  $ErrorActionPreference = 'Stop'
+                  $version = $env:RELEASE_VERSION
+                  if ($version -notmatch '^\d+\.\d+\.\d+$') {
+                      throw "Version invalid. Must be in the format 0.1.0."
+                  }
+
+                  "version=$version" >> $env:GITHUB_OUTPUT
+                  if (-not (Test-Path -LiteralPath 'setup/fw-setup.ps1' -PathType Leaf)) {
+                      throw 'setup/fw-setup.ps1 is required for a Windows release.'
+                  }
+                  $sha = (Get-FileHash -LiteralPath 'setup/fw-setup.ps1' -Algorithm SHA256).Hash.ToLowerInvariant()
+                  "setup_script_sha=$sha" >> $env:GITHUB_OUTPUT
+                  Write-Host "fw-setup.ps1 SHA-256: $sha"
+
+            - name: Install Windows Rust targets
+              shell: pwsh
+              run: rustup target add i686-pc-windows-msvc x86_64-pc-windows-msvc
+
+            - name: Build Windows release binaries
+              shell: pwsh
+              env:
+                  RELEASE_VERSION: ${{ inputs.version }}
+                  SETUP_SCRIPT_SHA: ${{ steps.metadata.outputs.setup_script_sha }}
+              run: |
+                  $ErrorActionPreference = 'Stop'
+                  $env:FW_APP_VERSION = $env:RELEASE_VERSION
+                  $env:FW_SETUP_SCRIPT_SHA = $env:SETUP_SCRIPT_SHA
+
+                  cargo build --locked --release --target i686-pc-windows-msvc
+                  cargo build --locked --release --target x86_64-pc-windows-msvc
+
+                  New-Item -ItemType Directory -Force -Path 'release-assets' | Out-Null
+                  Copy-Item -LiteralPath 'target/i686-pc-windows-msvc/release/fw.exe' -Destination "release-assets/fw-windows-portable-i386-v$($env:RELEASE_VERSION).exe"
+                  Copy-Item -LiteralPath 'target/x86_64-pc-windows-msvc/release/fw.exe' -Destination "release-assets/fw-windows-portable-amd64-v$($env:RELEASE_VERSION).exe"
+                  Copy-Item -LiteralPath 'setup/fw-setup.ps1' -Destination 'release-assets/fw-setup.ps1'
+
+            - name: Upload Windows build outputs
+              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+              with:
+                  name: windows-build-${{ inputs.version }}
+                  path: release-assets/
+                  if-no-files-found: error
+                  retention-days: 3
+
+    package-windows:
+        name: Package Windows NSIS installer
+        needs: build-windows
+        runs-on: windows-latest
+        permissions:
+            contents: read
+
+        steps:
+            - name: Checkout selected revision
+              uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+              with:
+                  ref: ${{ github.sha }}
+                  persist-credentials: false
+
+            - name: Download Windows build outputs
+              uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+              with:
+                  name: windows-build-${{ inputs.version }}
+                  path: release-assets
+
+            - name: Install NSIS
+              shell: pwsh
+              run: choco install nsis --yes --no-progress
+
+            - name: Build universal Windows installer
+              shell: pwsh
+              env:
+                  RELEASE_VERSION: ${{ inputs.version }}
+              run: |
+                  $ErrorActionPreference = 'Stop'
+                  $makensis = Join-Path ${env:ProgramFiles(x86)} 'NSIS/makensis.exe'
+                  if (-not (Test-Path -LiteralPath $makensis -PathType Leaf)) {
+                      throw "makensis.exe was not found at $makensis"
+                  }
+
+                  $root = (Get-Location).Path
+                  $i386 = Join-Path $root "release-assets/fw-windows-portable-i386-v$($env:RELEASE_VERSION).exe"
+                  $amd64 = Join-Path $root "release-assets/fw-windows-portable-amd64-v$($env:RELEASE_VERSION).exe"
+                  $output = Join-Path $root "release-assets/fw-windows-setup-v$($env:RELEASE_VERSION).exe"
+
+                  & $makensis /V4 "/DAPP_VERSION=$env:RELEASE_VERSION" "/DI386_BINARY=$i386" "/DAMD64_BINARY=$amd64" "/DOUTPUT_FILE=$output" 'setup/installer.nsi'
+                  if ($LASTEXITCODE -ne 0) { throw "NSIS failed with exit code $LASTEXITCODE" }
+
+            - name: Upload packaged Windows release
+              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+              with:
+                  name: windows-release-${{ inputs.version }}
+                  path: release-assets/
+                  if-no-files-found: error
+                  retention-days: 3
+
+    release:
+        name: Publish GitHub release
+        needs:
+            - package-windows
+            # - package-macos
+            # - package-linux
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+
+        steps:
+            - name: Checkout selected revision
+              uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+              with:
+                  ref: ${{ github.sha }}
+                  persist-credentials: false
+
+            - name: Download packaged Windows release
+              uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+              with:
+                  name: windows-release-${{ inputs.version }}
+                  path: release-assets
+
+            # - name: Download packaged macOS release
+            #   uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+            #   with:
+            #       name: macos-release-${{ inputs.version }}
+            #       path: release-assets
+
+            # - name: Download packaged Linux release
+            #   uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+            #   with:
+            #       name: linux-release-${{ inputs.version }}
+            #       path: release-assets
+
+            - name: Verify release contents
+              shell: bash
+              env:
+                  RELEASE_VERSION: ${{ inputs.version }}
+              run: |
+                  set -euo pipefail
+                  version="$RELEASE_VERSION"
+                  expected=(
+                    "release-assets/fw-windows-setup-v${version}.exe"
+                    "release-assets/fw-windows-portable-i386-v${version}.exe"
+                    "release-assets/fw-windows-portable-amd64-v${version}.exe"
+                    "release-assets/fw-setup.ps1"
+                  )
+                  for file in "${expected[@]}"; do
+                    test -f "$file" || { echo "Missing required release file: $file" >&2; exit 1; }
+                  done
+                  test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq 4 || {
+                    echo 'Release directory must contain exactly the four expected files.' >&2
+                    find release-assets -maxdepth 1 -type f -print >&2
+                    exit 1
+                  }
+
+            - name: Create GitHub release
+              uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
+              with:
+                  tag_name: ${{ inputs.version }}
+                  target_commitish: ${{ github.sha }}
+                  generate_release_notes: true
+                  fail_on_unmatched_files: true
+                  files: |
+                      release-assets/fw-windows-setup-v${{ inputs.version }}.exe
+                      release-assets/fw-windows-portable-i386-v${{ inputs.version }}.exe
+                      release-assets/fw-windows-portable-amd64-v${{ inputs.version }}.exe
+                      release-assets/fw-setup.ps1

@@ -12,6 +12,7 @@ use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 use crate::error::{FwError, Result};
 use crate::ui::{StartupProgress, StatusKind, write_status};
 
+const PROJECT_URL: &str = "https://github.com/then77/cf-fw";
 const RELEASE_BASE_URL: &str = "https://github.com/then77/cf-fw/releases/download";
 const MAX_SETUP_SCRIPT_BYTES: u64 = 16 * 1024 * 1024;
 const UNAVAILABLE_MESSAGE: &str = "This app version does not include setup flow.";
@@ -68,6 +69,10 @@ impl SetupMetadata {
     }
 }
 
+pub(crate) fn is_eligible() -> bool {
+    SetupMetadata::embedded().is_ok()
+}
+
 pub async fn run() -> Result<()> {
     match run_inner().await {
         Ok(()) => Ok(()),
@@ -93,6 +98,10 @@ async fn run_inner() -> Result<()> {
 
     println!("\nSetup will download setup script from:");
     println!("{}\n", style(&url).green());
+    println!(
+        "If you use a custom Cloudflare Tunnel configuration, consider installing FW manually."
+    );
+    println!("More information: {}\n", PROJECT_URL);
     if !confirm_setup()? {
         return Ok(());
     }

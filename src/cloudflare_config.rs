@@ -11,7 +11,7 @@ use crate::config::{
     MIN_PROXY_PORT,
 };
 use crate::error::{FwError, Result};
-use crate::platform::executable_directory_from;
+use crate::platform::{executable_directory_from, executable_name_from};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -41,8 +41,13 @@ impl InstallPaths {
         let cloudflared = cloudflare_dir.join(CLOUDFLARED_FILENAME);
         let cloudflare_config = cloudflare_dir.join(CLOUDFLARE_CONFIG_FILENAME);
 
-        require_regular_file(CLOUDFLARED_FILENAME, &cloudflared)?;
-        require_regular_file(CLOUDFLARE_CONFIG_FILENAME, &cloudflare_config)?;
+        require_cloudflare_directory(&cloudflare_dir, &fw_executable)?;
+        require_regular_file(CLOUDFLARED_FILENAME, &cloudflared, &fw_executable)?;
+        require_regular_file(
+            CLOUDFLARE_CONFIG_FILENAME,
+            &cloudflare_config,
+            &fw_executable,
+        )?;
 
         Ok(Self {
             fw_executable,
@@ -56,8 +61,17 @@ impl InstallPaths {
 
 /// Checks the managed ingress contract without changing `config.yml`.
 pub fn preflight_validate(paths: &InstallPaths) -> Result<()> {
-    require_regular_file(CLOUDFLARED_FILENAME, &paths.cloudflared)?;
-    require_regular_file(CLOUDFLARE_CONFIG_FILENAME, &paths.cloudflare_config)?;
+    require_cloudflare_directory(&paths.cloudflare_dir, &paths.fw_executable)?;
+    require_regular_file(
+        CLOUDFLARED_FILENAME,
+        &paths.cloudflared,
+        &paths.fw_executable,
+    )?;
+    require_regular_file(
+        CLOUDFLARE_CONFIG_FILENAME,
+        &paths.cloudflare_config,
+        &paths.fw_executable,
+    )?;
     let input = fs::read_to_string(&paths.cloudflare_config)?;
     normalize_yaml(&input, MIN_PROXY_PORT)?;
     Ok(())
@@ -75,8 +89,17 @@ pub async fn normalize_validate_and_replace(
 ) -> Result<String> {
     // Recheck immediately before mutation in case installation files changed
     // after startup path resolution.
-    require_regular_file(CLOUDFLARED_FILENAME, &paths.cloudflared)?;
-    require_regular_file(CLOUDFLARE_CONFIG_FILENAME, &paths.cloudflare_config)?;
+    require_cloudflare_directory(&paths.cloudflare_dir, &paths.fw_executable)?;
+    require_regular_file(
+        CLOUDFLARED_FILENAME,
+        &paths.cloudflared,
+        &paths.fw_executable,
+    )?;
+    require_regular_file(
+        CLOUDFLARE_CONFIG_FILENAME,
+        &paths.cloudflare_config,
+        &paths.fw_executable,
+    )?;
 
     let input = fs::read_to_string(&paths.cloudflare_config)?;
     let normalized = normalize_yaml(&input, proxy_port)?;
@@ -211,11 +234,23 @@ fn wildcard_base_domain(hostname: &str, index: usize) -> Result<Option<String>> 
     Ok(Some(domain))
 }
 
-fn require_regular_file(name: &'static str, path: &Path) -> Result<()> {
+fn require_cloudflare_directory(path: &Path, fw_executable: &Path) -> Result<()> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) | Err(_) => Err(FwError::MissingCloudflareDirectory {
+            executable_name: executable_name_from(fw_executable)?,
+            path: path.to_path_buf(),
+            setup_eligible: crate::setup::is_eligible(),
+        }),
+    }
+}
+
+fn require_regular_file(name: &'static str, path: &Path, fw_executable: &Path) -> Result<()> {
     match fs::metadata(path) {
         Ok(metadata) if metadata.is_file() => Ok(()),
         Ok(_) | Err(_) => Err(FwError::MissingSibling {
             name,
+            executable_name: executable_name_from(fw_executable)?,
             path: path.to_path_buf(),
         }),
     }
