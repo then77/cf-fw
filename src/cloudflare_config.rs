@@ -335,15 +335,8 @@ fn write_and_flush(file: &mut File, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
 fn atomic_replace(source: &Path, destination: &Path) -> Result<()> {
-    crate::platform::windows::atomic_replace(source, destination)
-}
-
-#[cfg(not(windows))]
-fn atomic_replace(source: &Path, destination: &Path) -> Result<()> {
-    fs::rename(source, destination)?;
-    Ok(())
+    crate::platform::atomic_replace(source, destination)
 }
 
 #[cfg(test)]

@@ -346,6 +346,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "indicatif",
+ "libc",
  "rand 0.9.5",
  "reqwest",
  "serde",

@@ -4,7 +4,7 @@ use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::RawHandle;
 use std::os::windows::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::ptr::{null, null_mut};
 
@@ -29,9 +29,6 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::error::{FwError, Result};
-
-const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UserObjectNames {
@@ -63,7 +60,7 @@ impl UserObjectNames {
 
 pub fn current_user_sid_hash() -> Result<String> {
     let sid = current_user_sid_bytes()?;
-    Ok(fnv1a_hex(sid.iter().copied()))
+    Ok(crate::platform::fnv1a_hex(sid.iter().copied()))
 }
 
 fn installation_directory_hash(executable: &Path) -> Result<String> {
@@ -73,16 +70,9 @@ fn installation_directory_hash(executable: &Path) -> Result<String> {
         .to_string_lossy()
         .replace('/', r"\")
         .to_lowercase();
-    Ok(fnv1a_hex(
+    Ok(crate::platform::fnv1a_hex(
         normalized.encode_utf16().flat_map(u16::to_le_bytes),
     ))
-}
-
-fn fnv1a_hex(bytes: impl IntoIterator<Item = u8>) -> String {
-    let hash = bytes.into_iter().fold(FNV_OFFSET_BASIS, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
-    });
-    format!("{hash:016x}")
 }
 
 fn current_user_sid_bytes() -> Result<Vec<u8>> {
@@ -195,6 +185,35 @@ impl Drop for NamedMutex {
                 ReleaseMutex(self.handle.raw());
             }
         }
+    }
+}
+
+pub type DaemonGuard = NamedMutex;
+pub type StartupGuard = NamedMutex;
+
+#[derive(Debug)]
+pub struct RuntimeScope {
+    names: UserObjectNames,
+    endpoint: PathBuf,
+}
+
+impl RuntimeScope {
+    pub fn current() -> Result<Self> {
+        let names = UserObjectNames::current()?;
+        let endpoint = PathBuf::from(&names.pipe);
+        Ok(Self { names, endpoint })
+    }
+
+    pub fn endpoint(&self) -> &Path {
+        &self.endpoint
+    }
+
+    pub fn acquire_daemon(&self) -> Result<DaemonGuard> {
+        NamedMutex::acquire_daemon(&self.names.daemon_mutex)
+    }
+
+    pub fn acquire_startup(&self) -> Result<StartupGuard> {
+        NamedMutex::acquire_startup(&self.names.startup_mutex)
     }
 }
 

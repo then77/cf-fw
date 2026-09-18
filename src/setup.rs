@@ -1,12 +1,18 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+#[cfg(unix)]
+use std::io::{Read, Seek};
+#[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use console::style;
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
+#[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
 use crate::error::{FwError, Result};
@@ -16,6 +22,14 @@ const PROJECT_URL: &str = "https://github.com/then77/cf-fw";
 const RELEASE_BASE_URL: &str = "https://github.com/then77/cf-fw/releases/download";
 const MAX_SETUP_SCRIPT_BYTES: u64 = 16 * 1024 * 1024;
 const UNAVAILABLE_MESSAGE: &str = "This app version does not include setup flow.";
+#[cfg(windows)]
+const SETUP_SCRIPT_NAME: &str = "fw-setup.ps1";
+#[cfg(unix)]
+const SETUP_SCRIPT_NAME: &str = "fw-setup.sh";
+#[cfg(windows)]
+const SETUP_SCRIPT_EXTENSION: &str = "ps1";
+#[cfg(unix)]
+const SETUP_SCRIPT_EXTENSION: &str = "sh";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SetupMetadata {
@@ -61,11 +75,14 @@ impl SetupMetadata {
     }
 
     fn url(&self) -> String {
-        format!("{RELEASE_BASE_URL}/{}/fw-setup.ps1", self.version)
+        format!("{RELEASE_BASE_URL}/{}/{SETUP_SCRIPT_NAME}", self.version)
     }
 
     fn temp_path(&self) -> PathBuf {
-        std::env::temp_dir().join(format!("fw-setup-{}.ps1", self.version))
+        std::env::temp_dir().join(format!(
+            "fw-setup-{}.{}",
+            self.version, SETUP_SCRIPT_EXTENSION
+        ))
     }
 }
 
@@ -141,7 +158,7 @@ async fn run_inner() -> Result<()> {
         "Launching script...",
     )?;
     let fw_path = crate::platform::executable_path()?;
-    let mut child = spawn_powershell(&script_path, &fw_path).await?;
+    let mut child = spawn_setup(&script_path, &fw_path, &mut script).await?;
     let status = child.wait().await?;
 
     if !status.success() {
@@ -208,11 +225,17 @@ async fn download_script(url: &str, path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
 fn open_locked_script(path: &Path) -> Result<File> {
     Ok(OpenOptions::new()
         .read(true)
         .share_mode(FILE_SHARE_READ)
         .open(path)?)
+}
+
+#[cfg(unix)]
+fn open_locked_script(path: &Path) -> Result<File> {
+    Ok(OpenOptions::new().read(true).open(path)?)
 }
 
 fn verify_script(script: &mut File, expected_sha256: &str) -> Result<()> {
@@ -232,7 +255,8 @@ fn verify_script(script: &mut File, expected_sha256: &str) -> Result<()> {
     Ok(())
 }
 
-async fn spawn_powershell(script: &Path, fw_path: &Path) -> Result<Child> {
+#[cfg(windows)]
+async fn spawn_setup(script: &Path, fw_path: &Path, _verified_script: &mut File) -> Result<Child> {
     match powershell_command("pwsh.exe", script, fw_path).spawn() {
         Ok(child) => Ok(child),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -242,6 +266,7 @@ async fn spawn_powershell(script: &Path, fw_path: &Path) -> Result<Child> {
     }
 }
 
+#[cfg(windows)]
 fn powershell_command(program: &str, script: &Path, fw_path: &Path) -> Command {
     let mut command = Command::new(program);
     command
@@ -253,6 +278,43 @@ fn powershell_command(program: &str, script: &Path, fw_path: &Path) -> Command {
         .arg("-FWPath")
         .arg(fw_path)
         .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    command
+}
+
+#[cfg(unix)]
+async fn spawn_setup(_script: &Path, fw_path: &Path, verified_script: &mut File) -> Result<Child> {
+    verified_script.rewind()?;
+    let mut bytes = Vec::new();
+    verified_script
+        .take(MAX_SETUP_SCRIPT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_SETUP_SCRIPT_BYTES {
+        return Err(FwError::Other(
+            "The setup script is unexpectedly large.".into(),
+        ));
+    }
+
+    let mut child = unix_setup_command(fw_path).spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| FwError::Other("setup shell stdin was not captured".into()))?;
+    stdin.write_all(&bytes).await?;
+    stdin.shutdown().await?;
+    Ok(child)
+}
+
+#[cfg(unix)]
+fn unix_setup_command(fw_path: &Path) -> Command {
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg("-s")
+        .arg("--")
+        .arg("--fw-path")
+        .arg(fw_path)
+        .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     command
@@ -285,6 +347,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn metadata_builds_release_url_and_safe_temp_name() {
         let metadata = SetupMetadata::from_values(Some("v1.2.3"), Some(&"A".repeat(64))).unwrap();
@@ -297,6 +360,19 @@ mod tests {
         assert!(SetupMetadata::from_values(Some("../bad"), Some(&"a".repeat(64))).is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn metadata_builds_unix_release_url_and_safe_temp_name() {
+        let metadata = SetupMetadata::from_values(Some("v1.2.3"), Some(&"A".repeat(64))).unwrap();
+        assert_eq!(
+            metadata.url(),
+            "https://github.com/then77/cf-fw/releases/download/v1.2.3/fw-setup.sh"
+        );
+        assert!(metadata.temp_path().ends_with("fw-setup-v1.2.3.sh"));
+        assert_eq!(metadata.sha256, "a".repeat(64));
+    }
+
+    #[cfg(windows)]
     #[test]
     fn powershell_receives_the_absolute_fw_executable_path() {
         let arguments = powershell_command(
@@ -321,6 +397,21 @@ mod tests {
                 r"D:\Programs\FW\renamed-fw.exe",
             ]
             .map(std::ffi::OsString::from)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_shell_receives_script_on_stdin_and_absolute_fw_path() {
+        let command = unix_setup_command(Path::new("/opt/fw/fw"));
+        let arguments = command
+            .as_std()
+            .get_args()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            arguments,
+            ["-s", "--", "--fw-path", "/opt/fw/fw"].map(std::ffi::OsString::from)
         );
     }
 

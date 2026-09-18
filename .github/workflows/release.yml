@@ -136,12 +136,145 @@ jobs:
                   if-no-files-found: error
                   retention-days: 3
 
+    test-linux:
+        name: Test Linux core
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+
+        steps:
+            - name: Checkout selected revision
+              uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+              with:
+                  ref: ${{ github.sha }}
+                  persist-credentials: false
+
+            - name: Run Linux test suite
+              run: cargo test --locked --all-targets
+
+    build-linux:
+        name: Build Linux ${{ matrix.arch }}
+        needs: test-linux
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - arch: amd64
+                      target: x86_64-unknown-linux-musl
+                    - arch: arm64
+                      target: aarch64-unknown-linux-musl
+
+        steps:
+            - name: Checkout selected revision
+              uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+              with:
+                  ref: ${{ github.sha }}
+                  persist-credentials: false
+
+            - name: Install cross
+              run: cargo install cross --locked --version 0.2.5
+
+            - name: Build portable Linux binary
+              env:
+                  FW_APP_VERSION: ${{ inputs.version }}
+              run: cross build --locked --release --target '${{ matrix.target }}'
+
+            - name: Stage Linux binary
+              env:
+                  RELEASE_VERSION: ${{ inputs.version }}
+                  TARGET: ${{ matrix.target }}
+                  ARCH: ${{ matrix.arch }}
+              run: |
+                  set -euo pipefail
+                  mkdir -p release-assets
+                  cp "target/${TARGET}/release/fw" "release-assets/fw-linux-portable-${ARCH}-v${RELEASE_VERSION}"
+                  chmod 0755 "release-assets/fw-linux-portable-${ARCH}-v${RELEASE_VERSION}"
+
+            - name: Upload Linux build output
+              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+              with:
+                  name: linux-build-${{ matrix.arch }}-${{ inputs.version }}
+                  path: release-assets/
+                  if-no-files-found: error
+                  retention-days: 3
+
+    test-macos:
+        name: Test macOS core
+        runs-on: macos-14
+        permissions:
+            contents: read
+
+        steps:
+            - name: Checkout selected revision
+              uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+              with:
+                  ref: ${{ github.sha }}
+                  persist-credentials: false
+
+            - name: Report runner architecture
+              run: uname -a
+
+            - name: Run macOS test suite
+              run: cargo test --locked --all-targets
+
+    build-macos:
+        name: Build macOS ${{ matrix.arch }}
+        needs: test-macos
+        runs-on: macos-14
+        permissions:
+            contents: read
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - arch: amd64
+                      target: x86_64-apple-darwin
+                    - arch: arm64
+                      target: aarch64-apple-darwin
+
+        steps:
+            - name: Checkout selected revision
+              uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+              with:
+                  ref: ${{ github.sha }}
+                  persist-credentials: false
+
+            - name: Install macOS Rust target
+              run: rustup target add '${{ matrix.target }}'
+
+            - name: Build portable macOS binary
+              env:
+                  FW_APP_VERSION: ${{ inputs.version }}
+              run: cargo build --locked --release --target '${{ matrix.target }}'
+
+            - name: Stage macOS binary
+              env:
+                  RELEASE_VERSION: ${{ inputs.version }}
+                  TARGET: ${{ matrix.target }}
+                  ARCH: ${{ matrix.arch }}
+              run: |
+                  set -euo pipefail
+                  mkdir -p release-assets
+                  cp "target/${TARGET}/release/fw" "release-assets/fw-macos-portable-${ARCH}-v${RELEASE_VERSION}"
+                  chmod 0755 "release-assets/fw-macos-portable-${ARCH}-v${RELEASE_VERSION}"
+
+            - name: Upload macOS build output
+              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+              with:
+                  name: macos-build-${{ matrix.arch }}-${{ inputs.version }}
+                  path: release-assets/
+                  if-no-files-found: error
+                  retention-days: 3
+
     release:
         name: Publish GitHub release
         needs:
             - package-windows
-            # - package-macos
-            # - package-linux
+            - build-linux
+            - build-macos
         runs-on: ubuntu-latest
         permissions:
             contents: write
