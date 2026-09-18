@@ -19,6 +19,17 @@ This file records checkpoints, skipped procedures, and validation limits for wor
 - The production socket code was not weakened. The three tests were corrected to use `#[tokio::test]`, matching the transport's actual runtime requirement.
 - Windows compilation was canceled by workflow failure propagation while still compiling dependencies; the preceding local Windows suite and release build had passed.
 
+## 2026-09-18 — Remote Unix test and build run 2
+
+- Dry-run workflow `35358179535` used `version=0.1.2` and `publish=no`.
+- Linux native test suite passed all 110 tests.
+- Apple Silicon macOS native test suite passed all 110 tests on the `macos-14-arm64` runner.
+- Portable Linux musl builds succeeded for AMD64 and ARM64.
+- Portable macOS builds succeeded for AMD64 and ARM64.
+- The full Windows MSVC build, NSIS packaging, four-file verification, and artifact upload remained green.
+- The GitHub release creation step was correctly skipped.
+- Experimental Unix build artifacts are uploaded separately and are not yet included in final release contents; setup migration and archive packaging must be completed first.
+
 ## Skipped or deferred procedures
 
 None yet. A procedure will be listed here rather than bypassed if it cannot be implemented or tested safely.
