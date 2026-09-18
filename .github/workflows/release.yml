@@ -7,6 +7,15 @@ on:
                 description: "Release/app version, ex: 0.1.0"
                 required: true
                 type: string
+            publish:
+                description: "Publish release"
+                required: true
+                default: "no"
+                type: choice
+                options:
+                    - "no"
+                    - "pre-release"
+                    - "release"
 
 concurrency:
     group: release-${{ inputs.version }}
@@ -185,10 +194,12 @@ jobs:
                   }
 
             - name: Create GitHub release
+              if: inputs.publish != 'no'
               uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
               with:
                   tag_name: ${{ inputs.version }}
                   target_commitish: ${{ github.sha }}
+                  prerelease: ${{ inputs.publish == 'pre-release' }}
                   generate_release_notes: true
                   fail_on_unmatched_files: true
                   files: |
