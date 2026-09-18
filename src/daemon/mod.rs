@@ -2,6 +2,8 @@ pub mod lifecycle;
 pub mod state;
 
 use std::collections::HashMap;
+#[cfg(any(unix, test))]
+use std::future::Future;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -9,6 +11,8 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, Notify, RwLock, mpsc};
+#[cfg(unix)]
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::cloudflare_config::{self, InstallPaths};
@@ -105,6 +109,8 @@ pub async fn run() -> Result<()> {
     let ipc_listener = crate::ipc::Listener::bind(scope.endpoint())?;
 
     let root = CancellationToken::new();
+    #[cfg(unix)]
+    let signal_task = spawn_unix_signal_task(root.clone())?;
     let shared = Shared::new(root.clone(), base_domain.clone());
     let lookup = Arc::new(RegistryLookup {
         registry: shared.registry.clone(),
@@ -123,6 +129,8 @@ pub async fn run() -> Result<()> {
         Err(error) => {
             root.cancel();
             let _ = proxy_task.await;
+            #[cfg(unix)]
+            let _ = signal_task.await;
             return Err(error);
         }
     };
@@ -130,6 +138,8 @@ pub async fn run() -> Result<()> {
         root.cancel();
         let _ = cloudflared.shutdown().await;
         let _ = proxy_task.await;
+        #[cfg(unix)]
+        let _ = signal_task.await;
         return Err(error);
     }
 
@@ -170,6 +180,13 @@ pub async fn run() -> Result<()> {
     let _ = cloudflared.shutdown().await;
     let _ = accept_task.await;
     let _ = idle_task.await;
+    #[cfg(unix)]
+    match signal_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) if fatal_error.is_none() => fatal_error = Some(error.into()),
+        Err(error) if fatal_error.is_none() => fatal_error = Some(error.into()),
+        _ => {}
+    }
     match proxy_task.await {
         Ok(Ok(())) => {}
         Ok(Err(error)) if fatal_error.is_none() => fatal_error = Some(error.into()),
@@ -182,6 +199,36 @@ pub async fn run() -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+#[cfg(any(unix, test))]
+async fn cancel_on_trigger<F>(shutdown: CancellationToken, trigger: F)
+where
+    F: Future<Output = ()>,
+{
+    tokio::pin!(trigger);
+    tokio::select! {
+        _ = shutdown.cancelled() => {}
+        _ = &mut trigger => shutdown.cancel(),
+    }
+}
+
+#[cfg(unix)]
+fn spawn_unix_signal_task(shutdown: CancellationToken) -> Result<JoinHandle<io::Result<()>>> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    Ok(tokio::spawn(async move {
+        let received = async move {
+            tokio::select! {
+                _ = terminate.recv() => {}
+                _ = interrupt.recv() => {}
+            }
+        };
+        cancel_on_trigger(shutdown, received).await;
+        Ok(())
+    }))
 }
 
 async fn accept_loop(
@@ -527,4 +574,31 @@ fn is_disconnect(error: &FwError) -> bool {
             | io::ErrorKind::ConnectionReset
             | io::ErrorKind::ConnectionAborted
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn signal_waiter_exits_when_another_shutdown_path_wins() {
+        let shutdown = CancellationToken::new();
+        let waiter = tokio::spawn(cancel_on_trigger(
+            shutdown.clone(),
+            std::future::pending::<()>(),
+        ));
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("signal waiter did not stop after cancellation")
+            .expect("signal waiter task failed");
+    }
+
+    #[tokio::test]
+    async fn signal_trigger_cancels_the_shared_shutdown_token() {
+        let shutdown = CancellationToken::new();
+        cancel_on_trigger(shutdown.clone(), std::future::ready(())).await;
+        assert!(shutdown.is_cancelled());
+    }
 }

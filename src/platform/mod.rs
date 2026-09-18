@@ -8,7 +8,11 @@ mod unix;
 pub(crate) mod windows;
 
 #[cfg(unix)]
+pub(crate) use unix::ChildSupervisor;
+#[cfg(unix)]
 pub use unix::{RuntimeScope, atomic_replace, spawn_daemon};
+#[cfg(windows)]
+pub(crate) use windows::ChildSupervisor;
 #[cfg(windows)]
 pub use windows::{RuntimeScope, atomic_replace, spawn_daemon};
 

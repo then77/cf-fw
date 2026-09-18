@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::ptr::{null, null_mut};
 
+use tokio::process::{Child as TokioChild, Command as TokioCommand};
+
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, WAIT_ABANDONED, WAIT_FAILED,
     WAIT_OBJECT_0,
@@ -238,8 +240,41 @@ pub fn spawn_daemon(executable: &Path) -> Result<Child> {
     Ok(command.spawn()?)
 }
 
-pub fn configure_no_window(command: &mut tokio::process::Command) -> &mut tokio::process::Command {
+pub fn configure_no_window(command: &mut TokioCommand) -> &mut TokioCommand {
     command.creation_flags(CREATE_NO_WINDOW)
+}
+
+#[derive(Debug)]
+pub(crate) struct ChildSupervisor {
+    job: JobObject,
+}
+
+impl ChildSupervisor {
+    pub(crate) fn prepare(command: &mut TokioCommand) -> Result<Self> {
+        configure_no_window(command);
+        Ok(Self {
+            job: JobObject::kill_on_close()?,
+        })
+    }
+
+    pub(crate) fn attach(&mut self, child: &TokioChild) -> Result<()> {
+        let handle = child
+            .raw_handle()
+            .ok_or_else(|| FwError::Other("cloudflared process handle is unavailable".into()))?;
+        self.job.assign_raw_handle(handle)
+    }
+
+    pub(crate) fn begin_shutdown(&self) -> Result<()> {
+        Ok(())
+    }
+
+    pub(crate) fn force_shutdown(&self) -> Result<()> {
+        self.job.terminate(1)
+    }
+
+    pub(crate) fn finish_shutdown(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub fn atomic_replace(source: &Path, destination: &Path) -> Result<()> {

@@ -30,6 +30,19 @@ This file records checkpoints, skipped procedures, and validation limits for wor
 - The GitHub release creation step was correctly skipped.
 - Experimental Unix build artifacts are uploaded separately and are not yet included in final release contents; setup migration and archive packaging must be completed first.
 
+## 2026-09-18 — Unix setup, lifecycle, and packaging implementation
+
+- Replaced the dependency-heavy Unix setup implementation with a single `fw-setup.sh` asset containing a small POSIX bootstrap and embedded Python standard-library setup source. No Python runtime or second setup asset is bundled.
+- The bootstrap never modifies an existing Python installation. When Python is absent, it requires explicit consent, records the exact package it installed in protected per-user state, retains it across failed retries, and removes only that recorded package after successful setup without using autoremove.
+- Added TTY- and `NO_COLOR`-aware terminal styling matching the Windows setup's headings, statuses, warning labels, and red-background error labels.
+- The Rust setup bootstrap now executes the verified open Unix script descriptor through `/dev/fd/3`, preserving interactive stdin and avoiding a pathname reopen after SHA-256 verification.
+- Independently verified the pinned Cloudflared `2026.9.1` Linux binary hashes and macOS archive hashes against GitHub release asset digests. The macOS extracted-binary hashes match the upstream release-note checksums.
+- Added Unix Cloudflared process-group supervision with orderly `SIGTERM`, bounded `SIGKILL` escalation, descendant cleanup tests, and normal child reaping. Windows continues to use its existing kill-on-close Job Object behavior.
+- Added Unix daemon `SIGTERM` and `SIGINT` handling through the existing root cancellation path, including tests that ensure the signal waiter exits when another shutdown source wins.
+- Expanded release packaging to native Linux and macOS test matrices, four verified portable `.tar.gz` archives, exact nine-file release aggregation, and a complete bundle artifact even when `publish=no`.
+- Local validation passed: `sh -n`, embedded setup self-test, workflow/file diagnostics, formatting, all 100 Windows GNU tests, and the Windows GNU release build/check.
+- Native Unix compilation, process-group tests, archive execution, runner-label availability, and final workflow aggregation still require the next GitHub Actions dry run with `publish=no`.
+
 ## Skipped or deferred procedures
 
-None yet. A procedure will be listed here rather than bypassed if it cannot be implemented or tested safely.
+- Live Cloudflare OAuth/API/tunnel testing remains intentionally deferred to manual testing; automated tests exercise pure setup logic and packaging without creating real Cloudflare resources.

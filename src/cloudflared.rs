@@ -15,8 +15,9 @@ use crate::config::{
     MAX_CLOUDFLARED_OUTPUT_LINES,
 };
 use crate::error::{FwError, Result};
+use crate::platform::ChildSupervisor;
 #[cfg(windows)]
-use crate::platform::windows::{JobObject, configure_no_window};
+use crate::platform::windows::configure_no_window;
 
 const READ_CHUNK_BYTES: usize = 4096;
 
@@ -111,8 +112,7 @@ pub struct CloudflaredProcess {
     child: Child,
     output: RecentOutput,
     output_tasks: Vec<JoinHandle<io::Result<()>>>,
-    #[cfg(windows)]
-    job: JobObject,
+    supervisor: ChildSupervisor,
 }
 
 impl CloudflaredProcess {
@@ -122,23 +122,12 @@ impl CloudflaredProcess {
         require_absolute(install_dir, "installation directory")?;
 
         let mut command = tunnel_command(executable, config, install_dir);
-        #[cfg(windows)]
-        configure_no_window(&mut command);
-
-        #[cfg(windows)]
-        let job = JobObject::kill_on_close()?;
+        let mut supervisor = ChildSupervisor::prepare(&mut command)?;
         let mut child = command.spawn()?;
-
-        #[cfg(windows)]
-        {
-            let assignment = child
-                .raw_handle()
-                .ok_or_else(|| FwError::Other("cloudflared process handle is unavailable".into()))
-                .and_then(|handle| job.assign_raw_handle(handle));
-            if let Err(error) = assignment {
-                let _ = child.start_kill();
-                return Err(error);
-            }
+        if let Err(error) = supervisor.attach(&child) {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(error);
         }
 
         let output = RecentOutput::new();
@@ -147,14 +136,14 @@ impl CloudflaredProcess {
             child,
             output,
             output_tasks,
-            #[cfg(windows)]
-            job,
+            supervisor,
         })
     }
 
     pub async fn stabilize(&mut self) -> Result<()> {
         tokio::time::sleep(CLOUDFLARED_STABILIZATION).await;
         if let Some(status) = self.child.try_wait()? {
+            self.supervisor.finish_shutdown()?;
             self.finish_output_tasks().await?;
             return Err(FwError::Other(format_exit_details(
                 status,
@@ -168,6 +157,7 @@ impl CloudflaredProcess {
         let Some(status) = self.child.try_wait()? else {
             return Ok(None);
         };
+        self.supervisor.finish_shutdown()?;
         self.finish_output_tasks().await?;
         Ok(Some(CloudflaredExit {
             status,
@@ -177,25 +167,25 @@ impl CloudflaredProcess {
 
     pub async fn shutdown(&mut self) -> Result<()> {
         if self.child.try_wait()?.is_some() {
+            self.supervisor.finish_shutdown()?;
             self.finish_output_tasks().await?;
             return Ok(());
         }
 
-        // A CREATE_NO_WINDOW Windows child has no console to receive Ctrl+C.
-        // Allow an already-initiated graceful exit to complete, then use the job
-        // object as the reliable bounded fallback required for daemon teardown.
+        // Unix requests an orderly process-group shutdown with SIGTERM. A
+        // CREATE_NO_WINDOW Windows child has no console signal, so its supervisor
+        // preserves the existing bounded wait followed by Job Object termination.
+        self.supervisor.begin_shutdown()?;
         match tokio::time::timeout(CHILD_SHUTDOWN_TIMEOUT, self.child.wait()).await {
             Ok(status) => {
                 status?;
             }
             Err(_) => {
-                #[cfg(windows)]
-                self.job.terminate(1)?;
-                #[cfg(not(windows))]
-                self.child.start_kill()?;
+                self.supervisor.force_shutdown()?;
                 self.child.wait().await?;
             }
         }
+        self.supervisor.finish_shutdown()?;
         self.finish_output_tasks().await
     }
 

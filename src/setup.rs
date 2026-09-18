@@ -1,7 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 #[cfg(unix)]
-use std::io::{Read, Seek};
+use std::os::fd::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -9,8 +9,6 @@ use std::process::Stdio;
 
 use console::style;
 use sha2::{Digest, Sha256};
-#[cfg(unix)]
-use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
@@ -285,38 +283,38 @@ fn powershell_command(program: &str, script: &Path, fw_path: &Path) -> Command {
 
 #[cfg(unix)]
 async fn spawn_setup(_script: &Path, fw_path: &Path, verified_script: &mut File) -> Result<Child> {
-    verified_script.rewind()?;
-    let mut bytes = Vec::new();
-    verified_script
-        .take(MAX_SETUP_SCRIPT_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_SETUP_SCRIPT_BYTES {
-        return Err(FwError::Other(
-            "The setup script is unexpectedly large.".into(),
-        ));
-    }
-
-    let mut child = unix_setup_command(fw_path).spawn()?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| FwError::Other("setup shell stdin was not captured".into()))?;
-    stdin.write_all(&bytes).await?;
-    stdin.shutdown().await?;
-    Ok(child)
+    let script_fd = verified_script.as_raw_fd();
+    unix_setup_command(fw_path, script_fd)
+        .spawn()
+        .map_err(Into::into)
 }
 
 #[cfg(unix)]
-fn unix_setup_command(fw_path: &Path) -> Command {
+fn unix_setup_command(fw_path: &Path, script_fd: std::os::fd::RawFd) -> Command {
+    const CHILD_SCRIPT_FD: libc::c_int = 3;
+
     let mut command = Command::new("/bin/sh");
     command
-        .arg("-s")
-        .arg("--")
+        .arg(format!("/dev/fd/{CHILD_SCRIPT_FD}"))
         .arg("--fw-path")
         .arg(fw_path)
-        .stdin(Stdio::piped())
+        .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    // SAFETY: The verified file remains open through spawn. dup2 is
+    // async-signal-safe and gives the child a non-CLOEXEC descriptor referring to
+    // the exact inode that was hashed, so the shell never reopens the pathname.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(script_fd, CHILD_SCRIPT_FD) == -1
+                || libc::fcntl(CHILD_SCRIPT_FD, libc::F_SETFD, 0) == -1
+            {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
     command
 }
 
@@ -402,8 +400,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unix_shell_receives_script_on_stdin_and_absolute_fw_path() {
-        let command = unix_setup_command(Path::new("/opt/fw/fw"));
+    fn unix_shell_receives_verified_descriptor_and_absolute_fw_path() {
+        let command = unix_setup_command(Path::new("/opt/fw/fw"), 9);
         let arguments = command
             .as_std()
             .get_args()
@@ -411,7 +409,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             arguments,
-            ["-s", "--", "--fw-path", "/opt/fw/fw"].map(std::ffi::OsString::from)
+            ["/dev/fd/3", "--fw-path", "/opt/fw/fw"].map(std::ffi::OsString::from)
         );
     }
 

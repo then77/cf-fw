@@ -7,6 +7,8 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
+use tokio::process::{Child as TokioChild, Command as TokioCommand};
+
 use crate::error::{FwError, Result};
 use crate::platform::{executable_path, fnv1a_hex, installation_directory_hash_bytes};
 
@@ -199,6 +201,83 @@ fn no_follow_flag() -> i32 {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn no_follow_flag() -> i32 {
     0
+}
+
+#[derive(Debug)]
+pub(crate) struct ChildSupervisor {
+    process_group: libc::pid_t,
+}
+
+impl ChildSupervisor {
+    pub(crate) fn prepare(command: &mut TokioCommand) -> Result<Self> {
+        // SAFETY: This closure runs in the child after fork and before exec. setpgid
+        // is async-signal-safe and uses no captured state or pointers.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        Ok(Self { process_group: 0 })
+    }
+
+    pub(crate) fn attach(&mut self, child: &TokioChild) -> Result<()> {
+        let pid = child
+            .id()
+            .ok_or_else(|| FwError::Other("cloudflared process ID is unavailable".into()))?;
+        let process_group = libc::pid_t::try_from(pid)
+            .map_err(|_| FwError::Other("cloudflared process ID is out of range".into()))?;
+        // The pre-exec setpgid(0, 0) makes the child's PID its process-group ID.
+        if process_group <= 0 || process_group == unsafe { libc::getpgrp() } {
+            return Err(FwError::Other(
+                "refusing to supervise an unsafe cloudflared process group".into(),
+            ));
+        }
+        self.process_group = process_group;
+        Ok(())
+    }
+
+    pub(crate) fn begin_shutdown(&self) -> Result<()> {
+        self.signal_group(libc::SIGTERM)
+    }
+
+    pub(crate) fn force_shutdown(&self) -> Result<()> {
+        self.signal_group(libc::SIGKILL)
+    }
+
+    pub(crate) fn finish_shutdown(&self) -> Result<()> {
+        self.force_shutdown()
+    }
+
+    fn signal_group(&self, signal: libc::c_int) -> Result<()> {
+        if self.process_group <= 0 || self.process_group == unsafe { libc::getpgrp() } {
+            return Err(FwError::Other(
+                "refusing to signal an unsafe cloudflared process group".into(),
+            ));
+        }
+        // SAFETY: A negative PID addresses the process group whose positive ID we
+        // recorded from the child created with setpgid(0, 0).
+        if unsafe { libc::kill(-self.process_group, signal) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(error.into())
+        }
+    }
+}
+
+impl Drop for ChildSupervisor {
+    fn drop(&mut self) {
+        if self.process_group > 0 {
+            let _ = self.signal_group(libc::SIGKILL);
+        }
+    }
 }
 
 pub fn spawn_daemon(executable: &Path) -> Result<Child> {
@@ -413,5 +492,94 @@ mod tests {
         let value = OsString::from_vec(directory.path().as_os_str().as_bytes().to_vec());
 
         assert_eq!(runtime_directory_from(value).unwrap(), directory.path());
+    }
+
+    #[tokio::test]
+    async fn supervised_child_uses_its_own_process_group() {
+        let mut command = TokioCommand::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("trap 'exit 0' TERM INT; while :; do sleep 1; done")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut supervisor = ChildSupervisor::prepare(&mut command).unwrap();
+        let mut child = command.spawn().unwrap();
+        supervisor.attach(&child).unwrap();
+        let pid = libc::pid_t::try_from(child.id().unwrap()).unwrap();
+
+        // SAFETY: pid identifies the live child spawned immediately above.
+        assert_eq!(unsafe { libc::getpgid(pid) }, pid);
+        // SAFETY: getpgrp has no preconditions.
+        assert_ne!(pid, unsafe { libc::getpgrp() });
+
+        supervisor.begin_shutdown().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), child.wait())
+            .await
+            .expect("supervised child ignored SIGTERM")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn supervised_group_can_escalate_to_sigkill() {
+        let mut command = TokioCommand::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("trap '' TERM; while :; do sleep 1; done")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut supervisor = ChildSupervisor::prepare(&mut command).unwrap();
+        let mut child = command.spawn().unwrap();
+        supervisor.attach(&child).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        supervisor.begin_shutdown().unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), child.wait())
+                .await
+                .is_err()
+        );
+        supervisor.force_shutdown().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), child.wait())
+            .await
+            .expect("supervised child survived SIGKILL")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn process_group_shutdown_reaches_descendants() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let mut command = TokioCommand::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("(trap 'exit 0' TERM INT; while :; do sleep 1; done) & child=$!; echo $child; wait $child")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut supervisor = ChildSupervisor::prepare(&mut command).unwrap();
+        let mut child = command.spawn().unwrap();
+        supervisor.attach(&child).unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut lines = BufReader::new(stdout).lines();
+        let descendant: libc::pid_t = lines
+            .next_line()
+            .await
+            .unwrap()
+            .expect("helper did not report descendant PID")
+            .parse()
+            .unwrap();
+
+        supervisor.begin_shutdown().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), child.wait())
+            .await
+            .expect("process group ignored SIGTERM")
+            .unwrap();
+
+        // SAFETY: signal 0 performs existence/permission checking only.
+        let result = unsafe { libc::kill(descendant, 0) };
+        assert_eq!(result, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
     }
 }
