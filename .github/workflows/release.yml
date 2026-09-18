@@ -23,6 +23,7 @@ concurrency:
 
 jobs:
     build-windows:
+        if: false # Temporarily disabled while validating Linux and macOS ARM64.
         name: Build Windows binaries
         runs-on: windows-latest
         permissions:
@@ -267,12 +268,20 @@ jobs:
                   binary="build-output/${base}"
                   setup_sha="$(sha256sum setup/fw-setup.sh | cut -d ' ' -f 1)"
                   chmod 0755 "$binary"
-                  grep -aFq "$setup_sha" "$binary"
-                  "$binary" --help >/dev/null
-                  "$binary" --version | grep -F "$RELEASE_VERSION"
-                  setup_output="$(printf 'n\n' | "$binary" --setup)"
-                  printf '%s\n' "$setup_output" | grep -F "https://github.com/then77/cf-fw/releases/download/${RELEASE_VERSION}/fw-setup.sh"
+                  echo 'CHECK: embedded setup SHA'
+                  grep -aFq "$setup_sha" "$binary" || { echo 'FAIL: embedded setup SHA was not found' >&2; exit 1; }
+                  echo 'CHECK: --help'
+                  "$binary" --help >/dev/null || { echo 'FAIL: --help' >&2; exit 1; }
+                  echo 'CHECK: --version'
+                  version_output="$("$binary" --version)" || { echo 'FAIL: --version did not run' >&2; exit 1; }
+                  printf '%s\n' "$version_output"
+                  grep -Fq "$RELEASE_VERSION" <<<"$version_output" || { echo 'FAIL: --version omitted the release version' >&2; exit 1; }
+                  echo 'CHECK: declined --setup'
+                  setup_output="$(printf 'n\n' | "$binary" --setup)" || { echo 'FAIL: declined --setup returned an error' >&2; exit 1; }
+                  printf '%s\n' "$setup_output"
+                  grep -Fq "https://github.com/then77/cf-fw/releases/download/${RELEASE_VERSION}/fw-setup.sh" <<<"$setup_output" || { echo 'FAIL: declined --setup omitted the expected URL' >&2; exit 1; }
 
+                  echo 'CHECK: archive structure and extracted executable'
                   mkdir -p "package/${base}" release-assets extracted
                   cp "$binary" "package/${base}/fw"
                   chmod 0755 "package/${base}/fw"
@@ -304,10 +313,8 @@ jobs:
             fail-fast: false
             matrix:
                 include:
-                    - arch: amd64
-                      runner: macos-15-intel
                     - arch: arm64
-                      runner: macos-14-arm64
+                      runner: macos-15-arm64
 
         steps:
             - name: Checkout selected revision
@@ -344,12 +351,9 @@ jobs:
             fail-fast: false
             matrix:
                 include:
-                    - arch: amd64
-                      target: x86_64-apple-darwin
-                      runner: macos-15-intel
                     - arch: arm64
                       target: aarch64-apple-darwin
-                      runner: macos-14-arm64
+                      runner: macos-15-arm64
 
         steps:
             - name: Checkout selected revision
@@ -410,10 +414,8 @@ jobs:
             fail-fast: false
             matrix:
                 include:
-                    - arch: amd64
-                      runner: macos-15-intel
                     - arch: arm64
-                      runner: macos-14-arm64
+                      runner: macos-15-arm64
 
         steps:
             - name: Checkout selected revision
@@ -438,12 +440,20 @@ jobs:
                   binary="build-output/${base}"
                   setup_sha="$(shasum -a 256 setup/fw-setup.sh | cut -d ' ' -f 1)"
                   chmod 0755 "$binary"
-                  grep -aFq "$setup_sha" "$binary"
-                  "$binary" --help >/dev/null
-                  "$binary" --version | grep -F "$RELEASE_VERSION"
-                  setup_output="$(printf 'n\n' | "$binary" --setup)"
-                  printf '%s\n' "$setup_output" | grep -F "https://github.com/then77/cf-fw/releases/download/${RELEASE_VERSION}/fw-setup.sh"
+                  echo 'CHECK: embedded setup SHA'
+                  grep -aFq "$setup_sha" "$binary" || { echo 'FAIL: embedded setup SHA was not found' >&2; exit 1; }
+                  echo 'CHECK: --help'
+                  "$binary" --help >/dev/null || { echo 'FAIL: --help' >&2; exit 1; }
+                  echo 'CHECK: --version'
+                  version_output="$("$binary" --version)" || { echo 'FAIL: --version did not run' >&2; exit 1; }
+                  printf '%s\n' "$version_output"
+                  grep -Fq "$RELEASE_VERSION" <<<"$version_output" || { echo 'FAIL: --version omitted the release version' >&2; exit 1; }
+                  echo 'CHECK: declined --setup'
+                  setup_output="$(printf 'n\n' | "$binary" --setup)" || { echo 'FAIL: declined --setup returned an error' >&2; exit 1; }
+                  printf '%s\n' "$setup_output"
+                  grep -Fq "https://github.com/then77/cf-fw/releases/download/${RELEASE_VERSION}/fw-setup.sh" <<<"$setup_output" || { echo 'FAIL: declined --setup omitted the expected URL' >&2; exit 1; }
 
+                  echo 'CHECK: archive structure and extracted executable'
                   mkdir -p "package/${base}" release-assets extracted
                   cp "$binary" "package/${base}/fw"
                   chmod 0755 "package/${base}/fw"
