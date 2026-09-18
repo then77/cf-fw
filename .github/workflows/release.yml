@@ -314,7 +314,7 @@ jobs:
             matrix:
                 include:
                     - arch: arm64
-                      runner: macos-15-arm64
+                      runner: macos-26-arm64
 
         steps:
             - name: Checkout selected revision
@@ -353,7 +353,7 @@ jobs:
                 include:
                     - arch: arm64
                       target: aarch64-apple-darwin
-                      runner: macos-15-arm64
+                      runner: macos-26-arm64
 
         steps:
             - name: Checkout selected revision
@@ -415,7 +415,7 @@ jobs:
             matrix:
                 include:
                     - arch: arm64
-                      runner: macos-15-arm64
+                      runner: macos-26-arm64
 
         steps:
             - name: Checkout selected revision
