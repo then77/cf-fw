@@ -23,7 +23,6 @@ concurrency:
 
 jobs:
     build-windows:
-        if: false # Temporarily disabled while validating Linux and macOS ARM64.
         name: Build Windows binaries
         runs-on: windows-latest
         permissions:
@@ -305,7 +304,6 @@ jobs:
                   retention-days: 3
 
     test-macos:
-        if: false # Temporarily disabled after ARM64 runner images repeatedly became unresponsive.
         name: Test macOS ${{ matrix.arch }}
         runs-on: ${{ matrix.runner }}
         permissions:
@@ -314,8 +312,10 @@ jobs:
             fail-fast: false
             matrix:
                 include:
+                    - arch: amd64
+                      runner: macos-15-intel
                     - arch: arm64
-                      runner: macos-26-arm64
+                      runner: macos-14-arm64
 
         steps:
             - name: Checkout selected revision
@@ -352,9 +352,12 @@ jobs:
             fail-fast: false
             matrix:
                 include:
+                    - arch: amd64
+                      target: x86_64-apple-darwin
+                      runner: macos-15-intel
                     - arch: arm64
                       target: aarch64-apple-darwin
-                      runner: macos-26-arm64
+                      runner: macos-14-arm64
 
         steps:
             - name: Checkout selected revision
@@ -415,8 +418,10 @@ jobs:
             fail-fast: false
             matrix:
                 include:
+                    - arch: amd64
+                      runner: macos-15-intel
                     - arch: arm64
-                      runner: macos-26-arm64
+                      runner: macos-14-arm64
 
         steps:
             - name: Checkout selected revision

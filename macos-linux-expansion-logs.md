@@ -56,3 +56,11 @@ This file records checkpoints, skipped procedures, and validation limits for wor
 
 - Live Cloudflare OAuth/API/tunnel testing remains intentionally deferred to manual testing; automated tests exercise pure setup logic and packaging without creating real Cloudflare resources.
 - Additional Apple Silicon macOS CI runs are deferred until GitHub-hosted ARM runners become responsive again.
+
+## 2026-09-18 — Linux release validation completed
+
+- Dry-run workflow `35371442706` used `version=0.1.9` and `publish=no`. Both Linux architectures passed all 115 native tests and produced successful musl release builds.
+- Both package jobs rejected the binaries because `--version` still reported the Cargo manifest version (`0.1.0`) even though the dispatched app version and setup SHA were embedded correctly. Release version reporting was moved to a compile-time `FW_APP_VERSION` value with `CARGO_PKG_VERSION` as the developer-build fallback.
+- Local validation built a Windows GNU executable with synthetic `FW_APP_VERSION=9.8.7` metadata and confirmed that it reported `fw 9.8.7`.
+- Dry-run workflow `35371975259` used `version=0.1.10` and `publish=no`. Linux AMD64 and ARM64 each passed all 116 native tests, built successfully as musl binaries, passed setup-SHA, help, release-version, declined-setup URL, archive-layout, permission, symlink, and extracted-executable checks, and uploaded both portable archives.
+- The workflow completed successfully, and release publication remained disabled. The temporary Windows and Intel macOS exclusions were then removed; the production workflow again includes all platforms, with Apple Silicon returned to the previously successful `macos-14-arm64` label.
