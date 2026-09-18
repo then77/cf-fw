@@ -577,6 +577,13 @@ mod tests {
             .await
             .expect("process group ignored SIGTERM")
             .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !received.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("descendant did not handle SIGTERM");
 
         assert_eq!(fs::read_to_string(received).unwrap(), "received");
     }
