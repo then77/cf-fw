@@ -455,12 +455,82 @@ jobs:
                   if-no-files-found: error
                   retention-days: 3
 
+    package-macos-installer:
+        name: Package universal macOS installer
+        needs: build-macos
+        runs-on: macos-15-intel
+        permissions:
+            contents: read
+
+        steps:
+            - name: Checkout selected revision
+              uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+              with:
+                  ref: ${{ github.sha }}
+                  persist-credentials: false
+
+            - name: Download macOS AMD64 build
+              uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+              with:
+                  name: macos-build-amd64-${{ inputs.version }}
+                  path: build-amd64
+
+            - name: Download macOS ARM64 build
+              uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+              with:
+                  name: macos-build-arm64-${{ inputs.version }}
+                  path: build-arm64
+
+            - name: Build and verify universal macOS installer
+              env:
+                  RELEASE_VERSION: ${{ inputs.version }}
+              run: |
+                  set -euo pipefail
+                  amd64="build-amd64/fw-macos-portable-amd64-v${RELEASE_VERSION}"
+                  arm64="build-arm64/fw-macos-portable-arm64-v${RELEASE_VERSION}"
+                  installer="release-assets/fw-macos-setup-v${RELEASE_VERSION}.pkg"
+
+                  mkdir -p package-root/usr/local/lib/fw package-root/usr/local/bin release-assets
+                  lipo -create "$amd64" "$arm64" -output package-root/usr/local/lib/fw/fw
+                  chmod 0755 package-root/usr/local/lib/fw/fw
+                  ln -s ../lib/fw/fw package-root/usr/local/bin/fw
+
+                  archs="$(lipo -archs package-root/usr/local/lib/fw/fw)"
+                  [[ "$archs" == 'x86_64 arm64' || "$archs" == 'arm64 x86_64' ]]
+
+                  pkgbuild \
+                    --root package-root \
+                    --scripts setup/macos \
+                    --identifier me.rlzy.fw \
+                    --version "$RELEASE_VERSION" \
+                    --install-location / \
+                    "$installer"
+
+                  pkgutil --expand-full "$installer" expanded-installer
+                  test -f expanded-installer/Payload/usr/local/lib/fw/fw
+                  test -x expanded-installer/Payload/usr/local/lib/fw/fw
+                  test -L expanded-installer/Payload/usr/local/bin/fw
+                  test "$(readlink expanded-installer/Payload/usr/local/bin/fw)" = '../lib/fw/fw'
+                  test -x expanded-installer/Scripts/postinstall
+                  grep -Fq 'identifier="me.rlzy.fw"' expanded-installer/PackageInfo
+                  grep -Fq "version=\"${RELEASE_VERSION}\"" expanded-installer/PackageInfo
+                  expanded-installer/Payload/usr/local/lib/fw/fw --version | grep -F "$RELEASE_VERSION"
+
+            - name: Upload packaged macOS installer
+              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+              with:
+                  name: macos-installer-${{ inputs.version }}
+                  path: release-assets/
+                  if-no-files-found: error
+                  retention-days: 3
+
     release:
         name: Assemble and publish release
         needs:
             - package-windows
             - package-linux
             - package-macos
+            - package-macos-installer
         runs-on: ubuntu-24.04
         permissions:
             contents: write
@@ -502,6 +572,12 @@ jobs:
                   name: macos-release-arm64-${{ inputs.version }}
                   path: release-assets
 
+            - name: Download packaged macOS installer
+              uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+              with:
+                  name: macos-installer-${{ inputs.version }}
+                  path: release-assets
+
             - name: Add Unix setup asset and verify release contents
               env:
                   RELEASE_VERSION: ${{ inputs.version }}
@@ -514,6 +590,7 @@ jobs:
                     "fw-windows-setup-v${version}.exe"
                     "fw-windows-portable-i386-v${version}.exe"
                     "fw-windows-portable-amd64-v${version}.exe"
+                    "fw-macos-setup-v${version}.pkg"
                     "fw-macos-portable-amd64-v${version}.tar.gz"
                     "fw-macos-portable-arm64-v${version}.tar.gz"
                     "fw-linux-portable-amd64-v${version}.tar.gz"
@@ -525,8 +602,8 @@ jobs:
                     test -f "release-assets/$name" || { echo "Missing required release file: release-assets/$name" >&2; exit 1; }
                     test ! -L "release-assets/$name" || { echo "Release file must not be a symlink: release-assets/$name" >&2; exit 1; }
                   done
-                  test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq 9 || {
-                    echo 'Release directory must contain exactly the nine expected files.' >&2
+                  test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq 10 || {
+                    echo 'Release directory must contain exactly the ten expected files.' >&2
                     find release-assets -maxdepth 1 -print >&2
                     exit 1
                   }
@@ -552,6 +629,7 @@ jobs:
                       release-assets/fw-windows-setup-v${{ inputs.version }}.exe
                       release-assets/fw-windows-portable-i386-v${{ inputs.version }}.exe
                       release-assets/fw-windows-portable-amd64-v${{ inputs.version }}.exe
+                      release-assets/fw-macos-setup-v${{ inputs.version }}.pkg
                       release-assets/fw-macos-portable-amd64-v${{ inputs.version }}.tar.gz
                       release-assets/fw-macos-portable-arm64-v${{ inputs.version }}.tar.gz
                       release-assets/fw-linux-portable-amd64-v${{ inputs.version }}.tar.gz
