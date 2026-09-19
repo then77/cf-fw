@@ -4,9 +4,11 @@ use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::RawHandle;
 use std::os::windows::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::ptr::{null, null_mut};
+
+use tokio::process::{Child as TokioChild, Command as TokioCommand};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, WAIT_ABANDONED, WAIT_FAILED,
@@ -30,8 +32,22 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::error::{FwError, Result};
 
-const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+pub fn user_data_directory() -> Result<PathBuf> {
+    let path = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            FwError::Other(
+                "LOCALAPPDATA is not set; cannot locate the user application data directory".into(),
+            )
+        })?;
+    if !path.is_absolute() {
+        return Err(FwError::Other(format!(
+            "LOCALAPPDATA must be absolute: {}",
+            path.display()
+        )));
+    }
+    Ok(path.join("FW"))
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UserObjectNames {
@@ -63,7 +79,7 @@ impl UserObjectNames {
 
 pub fn current_user_sid_hash() -> Result<String> {
     let sid = current_user_sid_bytes()?;
-    Ok(fnv1a_hex(sid.iter().copied()))
+    Ok(crate::platform::fnv1a_hex(sid.iter().copied()))
 }
 
 fn installation_directory_hash(executable: &Path) -> Result<String> {
@@ -73,16 +89,9 @@ fn installation_directory_hash(executable: &Path) -> Result<String> {
         .to_string_lossy()
         .replace('/', r"\")
         .to_lowercase();
-    Ok(fnv1a_hex(
+    Ok(crate::platform::fnv1a_hex(
         normalized.encode_utf16().flat_map(u16::to_le_bytes),
     ))
-}
-
-fn fnv1a_hex(bytes: impl IntoIterator<Item = u8>) -> String {
-    let hash = bytes.into_iter().fold(FNV_OFFSET_BASIS, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
-    });
-    format!("{hash:016x}")
 }
 
 fn current_user_sid_bytes() -> Result<Vec<u8>> {
@@ -198,6 +207,35 @@ impl Drop for NamedMutex {
     }
 }
 
+pub type DaemonGuard = NamedMutex;
+pub type StartupGuard = NamedMutex;
+
+#[derive(Debug)]
+pub struct RuntimeScope {
+    names: UserObjectNames,
+    endpoint: PathBuf,
+}
+
+impl RuntimeScope {
+    pub fn current() -> Result<Self> {
+        let names = UserObjectNames::current()?;
+        let endpoint = PathBuf::from(&names.pipe);
+        Ok(Self { names, endpoint })
+    }
+
+    pub fn endpoint(&self) -> &Path {
+        &self.endpoint
+    }
+
+    pub fn acquire_daemon(&self) -> Result<DaemonGuard> {
+        NamedMutex::acquire_daemon(&self.names.daemon_mutex)
+    }
+
+    pub fn acquire_startup(&self) -> Result<StartupGuard> {
+        NamedMutex::acquire_startup(&self.names.startup_mutex)
+    }
+}
+
 pub fn spawn_daemon(executable: &Path) -> Result<Child> {
     if !executable.is_absolute() {
         return Err(FwError::InvalidExecutableDirectory);
@@ -219,8 +257,41 @@ pub fn spawn_daemon(executable: &Path) -> Result<Child> {
     Ok(command.spawn()?)
 }
 
-pub fn configure_no_window(command: &mut tokio::process::Command) -> &mut tokio::process::Command {
+pub fn configure_no_window(command: &mut TokioCommand) -> &mut TokioCommand {
     command.creation_flags(CREATE_NO_WINDOW)
+}
+
+#[derive(Debug)]
+pub(crate) struct ChildSupervisor {
+    job: JobObject,
+}
+
+impl ChildSupervisor {
+    pub(crate) fn prepare(command: &mut TokioCommand) -> Result<Self> {
+        configure_no_window(command);
+        Ok(Self {
+            job: JobObject::kill_on_close()?,
+        })
+    }
+
+    pub(crate) fn attach(&mut self, child: &TokioChild) -> Result<()> {
+        let handle = child
+            .raw_handle()
+            .ok_or_else(|| FwError::Other("cloudflared process handle is unavailable".into()))?;
+        self.job.assign_raw_handle(handle)
+    }
+
+    pub(crate) fn begin_shutdown(&self) -> Result<()> {
+        Ok(())
+    }
+
+    pub(crate) fn force_shutdown(&self) -> Result<()> {
+        self.job.terminate(1)
+    }
+
+    pub(crate) fn finish_shutdown(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub fn atomic_replace(source: &Path, destination: &Path) -> Result<()> {

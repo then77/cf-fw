@@ -2,6 +2,8 @@ pub mod lifecycle;
 pub mod state;
 
 use std::collections::HashMap;
+#[cfg(any(unix, test))]
+use std::future::Future;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -9,6 +11,8 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, Notify, RwLock, mpsc};
+#[cfg(unix)]
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::cloudflare_config::{self, InstallPaths};
@@ -19,9 +23,8 @@ use crate::ipc::framing::{read_frame, write_frame};
 use crate::ipc::protocol::{
     ClientMessage, Envelope, ErrorCode, ServerMessage, StopSelector, TerminateReason,
 };
-use crate::ipc::windows::PipeListener;
 use crate::metrics::MetricsSampler;
-use crate::platform::windows::{NamedMutex, UserObjectNames};
+use crate::platform::RuntimeScope;
 use crate::proxy;
 use crate::registry::{Route, RouteRegistry};
 
@@ -87,8 +90,8 @@ impl Shared {
 }
 
 pub async fn run() -> Result<()> {
-    let names = UserObjectNames::current()?;
-    let _daemon_mutex = NamedMutex::acquire_daemon(&names.daemon_mutex)?;
+    let scope = RuntimeScope::current()?;
+    let _daemon_guard = scope.acquire_daemon()?;
     let paths = InstallPaths::resolve()?;
 
     let listener = proxy::reserve_listener()
@@ -103,10 +106,11 @@ pub async fn run() -> Result<()> {
             .await?
             .into();
 
-    let pipe_listener = PipeListener::new(names.pipe);
-    let first_pipe = pipe_listener.create_first_instance()?;
+    let ipc_listener = crate::ipc::Listener::bind(scope.endpoint())?;
 
     let root = CancellationToken::new();
+    #[cfg(unix)]
+    let signal_task = spawn_unix_signal_task(root.clone())?;
     let shared = Shared::new(root.clone(), base_domain.clone());
     let lookup = Arc::new(RegistryLookup {
         registry: shared.registry.clone(),
@@ -125,6 +129,8 @@ pub async fn run() -> Result<()> {
         Err(error) => {
             root.cancel();
             let _ = proxy_task.await;
+            #[cfg(unix)]
+            let _ = signal_task.await;
             return Err(error);
         }
     };
@@ -132,15 +138,18 @@ pub async fn run() -> Result<()> {
         root.cancel();
         let _ = cloudflared.shutdown().await;
         let _ = proxy_task.await;
+        #[cfg(unix)]
+        let _ = signal_task.await;
         return Err(error);
     }
 
     shared.mark_idle_if_empty().await;
     let accept_shared = shared.clone();
     let accept_shutdown = root.child_token();
-    let accept_task = tokio::spawn(async move {
-        accept_loop(pipe_listener, first_pipe, accept_shared, accept_shutdown).await
-    });
+    let accept_task =
+        tokio::spawn(
+            async move { accept_loop(ipc_listener, accept_shared, accept_shutdown).await },
+        );
 
     let idle_shared = shared.clone();
     let idle_task = tokio::spawn(async move { idle_monitor(idle_shared).await });
@@ -171,6 +180,13 @@ pub async fn run() -> Result<()> {
     let _ = cloudflared.shutdown().await;
     let _ = accept_task.await;
     let _ = idle_task.await;
+    #[cfg(unix)]
+    match signal_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) if fatal_error.is_none() => fatal_error = Some(error.into()),
+        Err(error) if fatal_error.is_none() => fatal_error = Some(error.into()),
+        _ => {}
+    }
     match proxy_task.await {
         Ok(Ok(())) => {}
         Ok(Err(error)) if fatal_error.is_none() => fatal_error = Some(error.into()),
@@ -185,19 +201,46 @@ pub async fn run() -> Result<()> {
     }
 }
 
+#[cfg(any(unix, test))]
+async fn cancel_on_trigger<F>(shutdown: CancellationToken, trigger: F)
+where
+    F: Future<Output = ()>,
+{
+    tokio::pin!(trigger);
+    tokio::select! {
+        _ = shutdown.cancelled() => {}
+        _ = &mut trigger => shutdown.cancel(),
+    }
+}
+
+#[cfg(unix)]
+fn spawn_unix_signal_task(shutdown: CancellationToken) -> Result<JoinHandle<io::Result<()>>> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    Ok(tokio::spawn(async move {
+        let received = async move {
+            tokio::select! {
+                _ = terminate.recv() => {}
+                _ = interrupt.recv() => {}
+            }
+        };
+        cancel_on_trigger(shutdown, received).await;
+        Ok(())
+    }))
+}
+
 async fn accept_loop(
-    listener: PipeListener,
-    mut pending: tokio::net::windows::named_pipe::NamedPipeServer,
+    mut listener: crate::ipc::Listener,
     shared: Shared,
     shutdown: CancellationToken,
 ) -> Result<()> {
     loop {
-        tokio::select! {
+        let connected = tokio::select! {
             _ = shutdown.cancelled() => return Ok(()),
-            connected = pending.connect() => connected?,
-        }
-        let connected = pending;
-        pending = listener.create_additional_instance()?;
+            connected = listener.accept() => connected?,
+        };
         let session_shared = shared.clone();
         tokio::spawn(async move {
             if let Err(error) = handle_connection(connected, session_shared).await {
@@ -531,4 +574,31 @@ fn is_disconnect(error: &FwError) -> bool {
             | io::ErrorKind::ConnectionReset
             | io::ErrorKind::ConnectionAborted
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn signal_waiter_exits_when_another_shutdown_path_wins() {
+        let shutdown = CancellationToken::new();
+        let waiter = tokio::spawn(cancel_on_trigger(
+            shutdown.clone(),
+            std::future::pending::<()>(),
+        ));
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("signal waiter did not stop after cancellation")
+            .expect("signal waiter task failed");
+    }
+
+    #[tokio::test]
+    async fn signal_trigger_cancels_the_shared_shutdown_token() {
+        let shutdown = CancellationToken::new();
+        cancel_on_trigger(shutdown.clone(), std::future::ready(())).await;
+        assert!(shutdown.is_cancelled());
+    }
 }

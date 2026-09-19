@@ -7,6 +7,15 @@ on:
                 description: "Release/app version, ex: 0.1.0"
                 required: true
                 type: string
+            publish:
+                description: "Publish release"
+                required: true
+                default: "no"
+                type: choice
+                options:
+                    - "no"
+                    - "pre-release"
+                    - "release"
 
 concurrency:
     group: release-${{ inputs.version }}
@@ -37,8 +46,6 @@ jobs:
                   if ($version -notmatch '^\d+\.\d+\.\d+$') {
                       throw "Version invalid. Must be in the format 0.1.0."
                   }
-
-                  "version=$version" >> $env:GITHUB_OUTPUT
                   if (-not (Test-Path -LiteralPath 'setup/fw-setup.ps1' -PathType Leaf)) {
                       throw 'setup/fw-setup.ps1 is required for a Windows release.'
                   }
@@ -49,6 +56,10 @@ jobs:
             - name: Install Windows Rust targets
               shell: pwsh
               run: rustup target add i686-pc-windows-msvc x86_64-pc-windows-msvc
+
+            - name: Run Windows test suite
+              shell: pwsh
+              run: cargo test --locked --all-targets
 
             - name: Build Windows release binaries
               shell: pwsh
@@ -67,6 +78,23 @@ jobs:
                   Copy-Item -LiteralPath 'target/i686-pc-windows-msvc/release/fw.exe' -Destination "release-assets/fw-windows-portable-i386-v$($env:RELEASE_VERSION).exe"
                   Copy-Item -LiteralPath 'target/x86_64-pc-windows-msvc/release/fw.exe' -Destination "release-assets/fw-windows-portable-amd64-v$($env:RELEASE_VERSION).exe"
                   Copy-Item -LiteralPath 'setup/fw-setup.ps1' -Destination 'release-assets/fw-setup.ps1'
+
+            - name: Verify Windows setup entrypoint
+              shell: pwsh
+              env:
+                  RELEASE_VERSION: ${{ inputs.version }}
+              run: |
+                  $ErrorActionPreference = 'Stop'
+                  $expectedUrl = "https://github.com/then77/cf-fw/releases/download/$($env:RELEASE_VERSION)/fw-setup.ps1"
+                  foreach ($arch in @('i386', 'amd64')) {
+                      $binary = "release-assets/fw-windows-portable-$arch-v$($env:RELEASE_VERSION).exe"
+                      $output = 'n' | & $binary --setup 2>&1
+                      if ($LASTEXITCODE -ne 0) { throw "$binary --setup failed with exit code $LASTEXITCODE" }
+                      if (($output -join "`n") -notlike "*$expectedUrl*") { throw "$binary --setup omitted the expected URL" }
+                      $portableOutput = 'n' | & $binary --setup --portable 2>&1
+                      if ($LASTEXITCODE -ne 0) { throw "$binary --setup --portable failed with exit code $LASTEXITCODE" }
+                      if (($portableOutput -join "`n") -notlike "*$expectedUrl*") { throw "$binary --setup --portable omitted the expected URL" }
+                  }
 
             - name: Upload Windows build outputs
               uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -127,13 +155,394 @@ jobs:
                   if-no-files-found: error
                   retention-days: 3
 
+
+    build-linux:
+        name: Build Linux ${{ matrix.arch }}
+        runs-on: ${{ matrix.runner }}
+        permissions:
+            contents: read
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - arch: amd64
+                      target: x86_64-unknown-linux-musl
+                      runner: ubuntu-24.04
+                    - arch: arm64
+                      target: aarch64-unknown-linux-musl
+                      runner: ubuntu-24.04-arm
+
+        steps:
+            - name: Checkout selected revision
+              uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+              with:
+                  ref: ${{ github.sha }}
+                  persist-credentials: false
+
+            - name: Validate release metadata
+              id: metadata
+              env:
+                  RELEASE_VERSION: ${{ inputs.version }}
+              run: |
+                  set -euo pipefail
+                  [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'Version invalid. Must be in the format 0.1.0.' >&2; exit 1; }
+                  test -f setup/fw-setup.sh
+                  sh -n setup/fw-setup.sh
+                  sha="$(sha256sum setup/fw-setup.sh | cut -d ' ' -f 1)"
+                  echo "setup_script_sha=$sha" >> "$GITHUB_OUTPUT"
+                  echo "fw-setup.sh SHA-256: $sha"
+
+            - name: Run Linux test suite
+              run: cargo test --locked --all-targets
+
+            - name: Prepare portable Linux builder
+              env:
+                  TARGET: ${{ matrix.target }}
+              run: |
+                  set -euo pipefail
+                  sudo apt-get update
+                  sudo apt-get install --yes musl-tools
+                  rustup target add "$TARGET"
+
+            - name: Build portable Linux binary
+              env:
+                  TARGET: ${{ matrix.target }}
+                  FW_APP_VERSION: ${{ inputs.version }}
+                  FW_SETUP_SCRIPT_SHA: ${{ steps.metadata.outputs.setup_script_sha }}
+                  CC_x86_64_unknown_linux_musl: musl-gcc
+                  CC_aarch64_unknown_linux_musl: musl-gcc
+                  CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+                  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+              run: cargo build --locked --release --target "$TARGET"
+
+            - name: Stage Linux binary
+              env:
+                  RELEASE_VERSION: ${{ inputs.version }}
+                  TARGET: ${{ matrix.target }}
+                  ARCH: ${{ matrix.arch }}
+              run: |
+                  set -euo pipefail
+                  mkdir -p release-assets
+                  cp "target/${TARGET}/release/fw" "release-assets/fw-linux-portable-${ARCH}-v${RELEASE_VERSION}"
+                  chmod 0755 "release-assets/fw-linux-portable-${ARCH}-v${RELEASE_VERSION}"
+
+            - name: Verify Linux binary
+              env:
+                  RELEASE_VERSION: ${{ inputs.version }}
+                  ARCH: ${{ matrix.arch }}
+              run: |
+                  set -euo pipefail
+                  binary="release-assets/fw-linux-portable-${ARCH}-v${RELEASE_VERSION}"
+                  setup_sha="$(sha256sum setup/fw-setup.sh | cut -d ' ' -f 1)"
+                  echo 'CHECK: embedded setup SHA'
+                  grep -aFq "$setup_sha" "$binary" || { echo 'FAIL: embedded setup SHA was not found' >&2; exit 1; }
+                  echo 'CHECK: --help'
+                  "$binary" --help >/dev/null || { echo 'FAIL: --help' >&2; exit 1; }
+                  echo 'CHECK: --version'
+                  version_output="$("$binary" --version)" || { echo 'FAIL: --version did not run' >&2; exit 1; }
+                  printf '%s\n' "$version_output"
+                  grep -Fq "$RELEASE_VERSION" <<<"$version_output" || { echo 'FAIL: --version omitted the release version' >&2; exit 1; }
+                  echo 'CHECK: declined --setup'
+                  setup_output="$(printf 'n\n' | "$binary" --setup)" || { echo 'FAIL: declined --setup returned an error' >&2; exit 1; }
+                  printf '%s\n' "$setup_output"
+                  grep -Fq "https://github.com/then77/cf-fw/releases/download/${RELEASE_VERSION}/fw-setup.sh" <<<"$setup_output" || { echo 'FAIL: declined --setup omitted the expected URL' >&2; exit 1; }
+                  echo 'CHECK: declined --setup --portable'
+                  portable_setup_output="$(printf 'n\n' | "$binary" --setup --portable)" || { echo 'FAIL: declined --setup --portable returned an error' >&2; exit 1; }
+                  printf '%s\n' "$portable_setup_output"
+                  grep -Fq "https://github.com/then77/cf-fw/releases/download/${RELEASE_VERSION}/fw-setup.sh" <<<"$portable_setup_output" || { echo 'FAIL: declined --setup --portable omitted the expected URL' >&2; exit 1; }
+
+            - name: Upload Linux build output
+              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+              with:
+                  name: linux-build-${{ matrix.arch }}-${{ inputs.version }}
+                  path: release-assets/
+                  if-no-files-found: error
+                  retention-days: 3
+
+    package-linux:
+        name: Package Linux ${{ matrix.arch }}
+        needs: build-linux
+        runs-on: ${{ matrix.runner }}
+        permissions:
+            contents: read
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - arch: amd64
+                      runner: ubuntu-24.04
+                    - arch: arm64
+                      runner: ubuntu-24.04-arm
+
+        steps:
+            - name: Download Linux build output
+              uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+              with:
+                  name: linux-build-${{ matrix.arch }}-${{ inputs.version }}
+                  path: build-output
+
+            - name: Package and verify Linux archive
+              env:
+                  RELEASE_VERSION: ${{ inputs.version }}
+                  ARCH: ${{ matrix.arch }}
+              run: |
+                  set -euo pipefail
+                  base="fw-linux-portable-${ARCH}-v${RELEASE_VERSION}"
+                  binary="build-output/${base}"
+                  chmod 0755 "$binary"
+                  echo 'CHECK: archive structure and extracted executable'
+                  mkdir -p "package/${base}" release-assets extracted
+                  cp "$binary" "package/${base}/fw"
+                  chmod 0755 "package/${base}/fw"
+                  tar -C package -czf "release-assets/${base}.tar.gz" "$base"
+                  mapfile -t members < <(tar -tzf "release-assets/${base}.tar.gz")
+                  [[ ${#members[@]} -eq 2 && "${members[0]}" == "${base}/" && "${members[1]}" == "${base}/fw" ]]
+                  tar -C extracted -xzf "release-assets/${base}.tar.gz"
+                  test -f "extracted/${base}/fw"
+                  test ! -L "extracted/${base}/fw"
+                  test "$(find extracted -type l -print -quit)" = ''
+                  test "$(find extracted -type f | wc -l)" -eq 1
+                  test "$(stat -c '%a' "extracted/${base}/fw")" = 755
+                  cmp -s "$binary" "extracted/${base}/fw"
+
+            - name: Upload packaged Linux release
+              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+              with:
+                  name: linux-release-${{ matrix.arch }}-${{ inputs.version }}
+                  path: release-assets/
+                  if-no-files-found: error
+                  retention-days: 3
+
+    build-macos:
+        name: Build macOS ${{ matrix.arch }}
+        runs-on: ${{ matrix.runner }}
+        permissions:
+            contents: read
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - arch: amd64
+                      target: x86_64-apple-darwin
+                      runner: macos-15-intel
+                    - arch: arm64
+                      target: aarch64-apple-darwin
+                      runner: macos-15
+
+        steps:
+            - name: Checkout selected revision
+              uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+              with:
+                  ref: ${{ github.sha }}
+                  persist-credentials: false
+
+            - name: Verify native runner architecture
+              env:
+                  ARCH: ${{ matrix.arch }}
+              run: |
+                  set -euo pipefail
+                  machine="$(uname -m)"
+                  if [[ "$ARCH" == amd64 ]]; then test "$machine" = x86_64; else test "$machine" = arm64; fi
+
+            - name: Validate release metadata
+              id: metadata
+              env:
+                  RELEASE_VERSION: ${{ inputs.version }}
+              run: |
+                  set -euo pipefail
+                  [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'Version invalid. Must be in the format 0.1.0.' >&2; exit 1; }
+                  test -f setup/fw-setup.sh
+                  sh -n setup/fw-setup.sh
+                  sha="$(shasum -a 256 setup/fw-setup.sh | cut -d ' ' -f 1)"
+                  echo "setup_script_sha=$sha" >> "$GITHUB_OUTPUT"
+                  echo "fw-setup.sh SHA-256: $sha"
+
+            - name: Run macOS test suite
+              run: cargo test --locked --all-targets
+
+            - name: Install macOS Rust target
+              run: rustup target add '${{ matrix.target }}'
+
+            - name: Build portable macOS binary
+              env:
+                  FW_APP_VERSION: ${{ inputs.version }}
+                  FW_SETUP_SCRIPT_SHA: ${{ steps.metadata.outputs.setup_script_sha }}
+              run: cargo build --locked --release --target '${{ matrix.target }}'
+
+            - name: Stage macOS binary
+              env:
+                  RELEASE_VERSION: ${{ inputs.version }}
+                  TARGET: ${{ matrix.target }}
+                  ARCH: ${{ matrix.arch }}
+              run: |
+                  set -euo pipefail
+                  mkdir -p release-assets
+                  cp "target/${TARGET}/release/fw" "release-assets/fw-macos-portable-${ARCH}-v${RELEASE_VERSION}"
+                  chmod 0755 "release-assets/fw-macos-portable-${ARCH}-v${RELEASE_VERSION}"
+
+            - name: Verify macOS binary
+              env:
+                  RELEASE_VERSION: ${{ inputs.version }}
+                  ARCH: ${{ matrix.arch }}
+              run: |
+                  set -euo pipefail
+                  binary="release-assets/fw-macos-portable-${ARCH}-v${RELEASE_VERSION}"
+                  setup_sha="$(shasum -a 256 setup/fw-setup.sh | cut -d ' ' -f 1)"
+                  echo 'CHECK: embedded setup SHA'
+                  grep -aFq "$setup_sha" "$binary" || { echo 'FAIL: embedded setup SHA was not found' >&2; exit 1; }
+                  echo 'CHECK: --help'
+                  "$binary" --help >/dev/null || { echo 'FAIL: --help' >&2; exit 1; }
+                  echo 'CHECK: --version'
+                  version_output="$("$binary" --version)" || { echo 'FAIL: --version did not run' >&2; exit 1; }
+                  printf '%s\n' "$version_output"
+                  grep -Fq "$RELEASE_VERSION" <<<"$version_output" || { echo 'FAIL: --version omitted the release version' >&2; exit 1; }
+                  echo 'CHECK: declined --setup'
+                  setup_output="$(printf 'n\n' | "$binary" --setup)" || { echo 'FAIL: declined --setup returned an error' >&2; exit 1; }
+                  printf '%s\n' "$setup_output"
+                  grep -Fq "https://github.com/then77/cf-fw/releases/download/${RELEASE_VERSION}/fw-setup.sh" <<<"$setup_output" || { echo 'FAIL: declined --setup omitted the expected URL' >&2; exit 1; }
+                  echo 'CHECK: declined --setup --portable'
+                  portable_setup_output="$(printf 'n\n' | "$binary" --setup --portable)" || { echo 'FAIL: declined --setup --portable returned an error' >&2; exit 1; }
+                  printf '%s\n' "$portable_setup_output"
+                  grep -Fq "https://github.com/then77/cf-fw/releases/download/${RELEASE_VERSION}/fw-setup.sh" <<<"$portable_setup_output" || { echo 'FAIL: declined --setup --portable omitted the expected URL' >&2; exit 1; }
+
+            - name: Upload macOS build output
+              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+              with:
+                  name: macos-build-${{ matrix.arch }}-${{ inputs.version }}
+                  path: release-assets/
+                  if-no-files-found: error
+                  retention-days: 3
+
+    package-macos:
+        name: Package macOS ${{ matrix.arch }}
+        needs: build-macos
+        runs-on: ${{ matrix.runner }}
+        permissions:
+            contents: read
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - arch: amd64
+                      runner: macos-15-intel
+                    - arch: arm64
+                      runner: macos-15
+
+        steps:
+            - name: Download macOS build output
+              uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+              with:
+                  name: macos-build-${{ matrix.arch }}-${{ inputs.version }}
+                  path: build-output
+
+            - name: Package and verify macOS archive
+              env:
+                  RELEASE_VERSION: ${{ inputs.version }}
+                  ARCH: ${{ matrix.arch }}
+              run: |
+                  set -euo pipefail
+                  base="fw-macos-portable-${ARCH}-v${RELEASE_VERSION}"
+                  binary="build-output/${base}"
+                  chmod 0755 "$binary"
+                  echo 'CHECK: archive structure and extracted executable'
+                  mkdir -p "package/${base}" release-assets extracted
+                  cp "$binary" "package/${base}/fw"
+                  chmod 0755 "package/${base}/fw"
+                  tar -C package -czf "release-assets/${base}.tar.gz" "$base"
+                  members="$(tar -tzf "release-assets/${base}.tar.gz")"
+                  expected="$(printf '%s/\n%s/fw' "$base" "$base")"
+                  test "$members" = "$expected"
+                  tar -C extracted -xzf "release-assets/${base}.tar.gz"
+                  test -f "extracted/${base}/fw"
+                  test ! -L "extracted/${base}/fw"
+                  test "$(find extracted -type l -print -quit)" = ''
+                  test "$(find extracted -type f | wc -l | tr -d ' ')" -eq 1
+                  test "$(stat -f '%Lp' "extracted/${base}/fw")" = 755
+                  cmp -s "$binary" "extracted/${base}/fw"
+
+            - name: Upload packaged macOS release
+              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+              with:
+                  name: macos-release-${{ matrix.arch }}-${{ inputs.version }}
+                  path: release-assets/
+                  if-no-files-found: error
+                  retention-days: 3
+
+    package-macos-installer:
+        name: Package universal macOS installer
+        needs: build-macos
+        runs-on: macos-15-intel
+        permissions:
+            contents: read
+
+        steps:
+            - name: Checkout selected revision
+              uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+              with:
+                  ref: ${{ github.sha }}
+                  persist-credentials: false
+
+            - name: Download macOS AMD64 build
+              uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+              with:
+                  name: macos-build-amd64-${{ inputs.version }}
+                  path: build-amd64
+
+            - name: Download macOS ARM64 build
+              uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+              with:
+                  name: macos-build-arm64-${{ inputs.version }}
+                  path: build-arm64
+
+            - name: Build and verify universal macOS installer
+              env:
+                  RELEASE_VERSION: ${{ inputs.version }}
+              run: |
+                  set -euo pipefail
+                  amd64="build-amd64/fw-macos-portable-amd64-v${RELEASE_VERSION}"
+                  arm64="build-arm64/fw-macos-portable-arm64-v${RELEASE_VERSION}"
+                  installer="release-assets/fw-macos-setup-v${RELEASE_VERSION}.pkg"
+
+                  mkdir -p package-root/usr/local/lib/fw package-root/usr/local/bin release-assets
+                  lipo -create "$amd64" "$arm64" -output package-root/usr/local/lib/fw/fw
+                  chmod 0755 package-root/usr/local/lib/fw/fw
+                  ln -s ../lib/fw/fw package-root/usr/local/bin/fw
+
+                  archs="$(lipo -archs package-root/usr/local/lib/fw/fw)"
+                  [[ "$archs" == 'x86_64 arm64' || "$archs" == 'arm64 x86_64' ]]
+
+                  pkgbuild \
+                    --root package-root \
+                    --identifier me.rlzy.fw \
+                    --version "$RELEASE_VERSION" \
+                    --install-location / \
+                    "$installer"
+
+                  pkgutil --expand-full "$installer" expanded-installer
+                  test -f expanded-installer/Payload/usr/local/lib/fw/fw
+                  test -x expanded-installer/Payload/usr/local/lib/fw/fw
+                  test -L expanded-installer/Payload/usr/local/bin/fw
+                  test "$(readlink expanded-installer/Payload/usr/local/bin/fw)" = '../lib/fw/fw'
+                  grep -Fq 'identifier="me.rlzy.fw"' expanded-installer/PackageInfo
+                  grep -Fq "version=\"${RELEASE_VERSION}\"" expanded-installer/PackageInfo
+                  expanded-installer/Payload/usr/local/lib/fw/fw --version | grep -F "$RELEASE_VERSION"
+
+            - name: Upload packaged macOS installer
+              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+              with:
+                  name: macos-installer-${{ inputs.version }}
+                  path: release-assets/
+                  if-no-files-found: error
+                  retention-days: 3
+
     release:
-        name: Publish GitHub release
+        name: Assemble and publish release
         needs:
             - package-windows
-            # - package-macos
-            # - package-linux
-        runs-on: ubuntu-latest
+            - package-linux
+            - package-macos
+            - package-macos-installer
+        runs-on: ubuntu-24.04
         permissions:
             contents: write
 
@@ -150,49 +559,91 @@ jobs:
                   name: windows-release-${{ inputs.version }}
                   path: release-assets
 
-            # - name: Download packaged macOS release
-            #   uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-            #   with:
-            #       name: macos-release-${{ inputs.version }}
-            #       path: release-assets
+            - name: Download packaged Linux AMD64 release
+              uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+              with:
+                  name: linux-release-amd64-${{ inputs.version }}
+                  path: release-assets
 
-            # - name: Download packaged Linux release
-            #   uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-            #   with:
-            #       name: linux-release-${{ inputs.version }}
-            #       path: release-assets
+            - name: Download packaged Linux ARM64 release
+              uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+              with:
+                  name: linux-release-arm64-${{ inputs.version }}
+                  path: release-assets
 
-            - name: Verify release contents
-              shell: bash
+            - name: Download packaged macOS AMD64 release
+              uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+              with:
+                  name: macos-release-amd64-${{ inputs.version }}
+                  path: release-assets
+
+            - name: Download packaged macOS ARM64 release
+              uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+              with:
+                  name: macos-release-arm64-${{ inputs.version }}
+                  path: release-assets
+
+            - name: Download packaged macOS installer
+              uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+              with:
+                  name: macos-installer-${{ inputs.version }}
+                  path: release-assets
+
+            - name: Add Unix setup asset and verify release contents
               env:
                   RELEASE_VERSION: ${{ inputs.version }}
               run: |
                   set -euo pipefail
+                  cp setup/fw-setup.sh release-assets/fw-setup.sh
+                  chmod 0755 release-assets/fw-setup.sh
                   version="$RELEASE_VERSION"
                   expected=(
-                    "release-assets/fw-windows-setup-v${version}.exe"
-                    "release-assets/fw-windows-portable-i386-v${version}.exe"
-                    "release-assets/fw-windows-portable-amd64-v${version}.exe"
-                    "release-assets/fw-setup.ps1"
+                    "fw-windows-setup-v${version}.exe"
+                    "fw-windows-portable-i386-v${version}.exe"
+                    "fw-windows-portable-amd64-v${version}.exe"
+                    "fw-macos-setup-v${version}.pkg"
+                    "fw-macos-portable-amd64-v${version}.tar.gz"
+                    "fw-macos-portable-arm64-v${version}.tar.gz"
+                    "fw-linux-portable-amd64-v${version}.tar.gz"
+                    "fw-linux-portable-arm64-v${version}.tar.gz"
+                    "fw-setup.ps1"
+                    "fw-setup.sh"
                   )
-                  for file in "${expected[@]}"; do
-                    test -f "$file" || { echo "Missing required release file: $file" >&2; exit 1; }
+                  for name in "${expected[@]}"; do
+                    test -f "release-assets/$name" || { echo "Missing required release file: release-assets/$name" >&2; exit 1; }
+                    test ! -L "release-assets/$name" || { echo "Release file must not be a symlink: release-assets/$name" >&2; exit 1; }
                   done
-                  test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq 4 || {
-                    echo 'Release directory must contain exactly the four expected files.' >&2
-                    find release-assets -maxdepth 1 -type f -print >&2
+                  test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq 10 || {
+                    echo 'Release directory must contain exactly the ten expected files.' >&2
+                    find release-assets -maxdepth 1 -print >&2
                     exit 1
                   }
 
+            - name: Upload complete release bundle
+              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+              with:
+                  name: complete-release-${{ inputs.version }}
+                  path: release-assets/
+                  if-no-files-found: error
+                  retention-days: 7
+
             - name: Create GitHub release
+              if: inputs.publish != 'no'
               uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
               with:
                   tag_name: ${{ inputs.version }}
                   target_commitish: ${{ github.sha }}
+                  prerelease: ${{ inputs.publish == 'pre-release' }}
                   generate_release_notes: true
                   fail_on_unmatched_files: true
                   files: |
                       release-assets/fw-windows-setup-v${{ inputs.version }}.exe
                       release-assets/fw-windows-portable-i386-v${{ inputs.version }}.exe
                       release-assets/fw-windows-portable-amd64-v${{ inputs.version }}.exe
+                      release-assets/fw-macos-setup-v${{ inputs.version }}.pkg
+                      release-assets/fw-macos-portable-amd64-v${{ inputs.version }}.tar.gz
+                      release-assets/fw-macos-portable-arm64-v${{ inputs.version }}.tar.gz
+                      release-assets/fw-linux-portable-amd64-v${{ inputs.version }}.tar.gz
+                      release-assets/fw-linux-portable-arm64-v${{ inputs.version }}.tar.gz
                       release-assets/fw-setup.ps1
+                      release-assets/fw-setup.sh

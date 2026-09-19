@@ -1,5 +1,8 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -7,6 +10,7 @@ use std::process::Stdio;
 use console::style;
 use sha2::{Digest, Sha256};
 use tokio::process::{Child, Command};
+#[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
 use crate::error::{FwError, Result};
@@ -16,6 +20,14 @@ const PROJECT_URL: &str = "https://github.com/then77/cf-fw";
 const RELEASE_BASE_URL: &str = "https://github.com/then77/cf-fw/releases/download";
 const MAX_SETUP_SCRIPT_BYTES: u64 = 16 * 1024 * 1024;
 const UNAVAILABLE_MESSAGE: &str = "This app version does not include setup flow.";
+#[cfg(windows)]
+const SETUP_SCRIPT_NAME: &str = "fw-setup.ps1";
+#[cfg(unix)]
+const SETUP_SCRIPT_NAME: &str = "fw-setup.sh";
+#[cfg(windows)]
+const SETUP_SCRIPT_EXTENSION: &str = "ps1";
+#[cfg(unix)]
+const SETUP_SCRIPT_EXTENSION: &str = "sh";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SetupMetadata {
@@ -61,11 +73,14 @@ impl SetupMetadata {
     }
 
     fn url(&self) -> String {
-        format!("{RELEASE_BASE_URL}/{}/fw-setup.ps1", self.version)
+        format!("{RELEASE_BASE_URL}/{}/{SETUP_SCRIPT_NAME}", self.version)
     }
 
     fn temp_path(&self) -> PathBuf {
-        std::env::temp_dir().join(format!("fw-setup-{}.ps1", self.version))
+        std::env::temp_dir().join(format!(
+            "fw-setup-{}.{}",
+            self.version, SETUP_SCRIPT_EXTENSION
+        ))
     }
 }
 
@@ -73,8 +88,8 @@ pub(crate) fn is_eligible() -> bool {
     SetupMetadata::embedded().is_ok()
 }
 
-pub async fn run() -> Result<()> {
-    match run_inner().await {
+pub async fn run(portable: bool) -> Result<()> {
+    match run_inner(portable).await {
         Ok(()) => Ok(()),
         Err(error) => {
             if write_status(
@@ -92,7 +107,7 @@ pub async fn run() -> Result<()> {
     }
 }
 
-async fn run_inner() -> Result<()> {
+async fn run_inner(portable: bool) -> Result<()> {
     let metadata = SetupMetadata::embedded()?;
     let url = metadata.url();
 
@@ -141,7 +156,7 @@ async fn run_inner() -> Result<()> {
         "Launching script...",
     )?;
     let fw_path = crate::platform::executable_path()?;
-    let mut child = spawn_powershell(&script_path, &fw_path).await?;
+    let mut child = spawn_setup(&script_path, &fw_path, portable, &mut script).await?;
     let status = child.wait().await?;
 
     if !status.success() {
@@ -208,11 +223,17 @@ async fn download_script(url: &str, path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
 fn open_locked_script(path: &Path) -> Result<File> {
     Ok(OpenOptions::new()
         .read(true)
         .share_mode(FILE_SHARE_READ)
         .open(path)?)
+}
+
+#[cfg(unix)]
+fn open_locked_script(path: &Path) -> Result<File> {
+    Ok(OpenOptions::new().read(true).open(path)?)
 }
 
 fn verify_script(script: &mut File, expected_sha256: &str) -> Result<()> {
@@ -232,17 +253,24 @@ fn verify_script(script: &mut File, expected_sha256: &str) -> Result<()> {
     Ok(())
 }
 
-async fn spawn_powershell(script: &Path, fw_path: &Path) -> Result<Child> {
-    match powershell_command("pwsh.exe", script, fw_path).spawn() {
+#[cfg(windows)]
+async fn spawn_setup(
+    script: &Path,
+    fw_path: &Path,
+    portable: bool,
+    _verified_script: &mut File,
+) -> Result<Child> {
+    match powershell_command("pwsh.exe", script, fw_path, portable).spawn() {
         Ok(child) => Ok(child),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            Ok(powershell_command("powershell.exe", script, fw_path).spawn()?)
+            Ok(powershell_command("powershell.exe", script, fw_path, portable).spawn()?)
         }
         Err(error) => Err(error.into()),
     }
 }
 
-fn powershell_command(program: &str, script: &Path, fw_path: &Path) -> Command {
+#[cfg(windows)]
+fn powershell_command(program: &str, script: &Path, fw_path: &Path, portable: bool) -> Command {
     let mut command = Command::new(program);
     command
         .arg("-NoProfile")
@@ -251,10 +279,60 @@ fn powershell_command(program: &str, script: &Path, fw_path: &Path) -> Command {
         .arg("-File")
         .arg(script)
         .arg("-FWPath")
-        .arg(fw_path)
+        .arg(fw_path);
+    if portable {
+        command.arg("-Portable");
+    }
+    command
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    command
+}
+
+#[cfg(unix)]
+async fn spawn_setup(
+    _script: &Path,
+    fw_path: &Path,
+    portable: bool,
+    verified_script: &mut File,
+) -> Result<Child> {
+    let script_fd = verified_script.as_raw_fd();
+    unix_setup_command(fw_path, portable, script_fd)
+        .spawn()
+        .map_err(Into::into)
+}
+
+#[cfg(unix)]
+fn unix_setup_command(fw_path: &Path, portable: bool, script_fd: std::os::fd::RawFd) -> Command {
+    const CHILD_SCRIPT_FD: libc::c_int = 3;
+
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg(format!("/dev/fd/{CHILD_SCRIPT_FD}"))
+        .arg("--fw-path")
+        .arg(fw_path);
+    if portable {
+        command.arg("--portable");
+    }
+    command
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    // SAFETY: The verified file remains open through spawn. dup2 is
+    // async-signal-safe and gives the child a non-CLOEXEC descriptor referring to
+    // the exact inode that was hashed, so the shell never reopens the pathname.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(script_fd, CHILD_SCRIPT_FD) == -1
+                || libc::fcntl(CHILD_SCRIPT_FD, libc::F_SETFD, 0) == -1
+            {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
     command
 }
 
@@ -285,6 +363,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn metadata_builds_release_url_and_safe_temp_name() {
         let metadata = SetupMetadata::from_values(Some("v1.2.3"), Some(&"A".repeat(64))).unwrap();
@@ -297,12 +376,26 @@ mod tests {
         assert!(SetupMetadata::from_values(Some("../bad"), Some(&"a".repeat(64))).is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn metadata_builds_unix_release_url_and_safe_temp_name() {
+        let metadata = SetupMetadata::from_values(Some("v1.2.3"), Some(&"A".repeat(64))).unwrap();
+        assert_eq!(
+            metadata.url(),
+            "https://github.com/then77/cf-fw/releases/download/v1.2.3/fw-setup.sh"
+        );
+        assert!(metadata.temp_path().ends_with("fw-setup-v1.2.3.sh"));
+        assert_eq!(metadata.sha256, "a".repeat(64));
+    }
+
+    #[cfg(windows)]
     #[test]
     fn powershell_receives_the_absolute_fw_executable_path() {
         let arguments = powershell_command(
             "pwsh.exe",
             Path::new(r"C:\Temp\fw-setup-v1.ps1"),
             Path::new(r"D:\Programs\FW\renamed-fw.exe"),
+            true,
         )
         .as_std()
         .get_args()
@@ -319,8 +412,24 @@ mod tests {
                 r"C:\Temp\fw-setup-v1.ps1",
                 "-FWPath",
                 r"D:\Programs\FW\renamed-fw.exe",
+                "-Portable",
             ]
             .map(std::ffi::OsString::from)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_shell_receives_verified_descriptor_and_absolute_fw_path() {
+        let command = unix_setup_command(Path::new("/opt/fw/fw"), true, 9);
+        let arguments = command
+            .as_std()
+            .get_args()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            arguments,
+            ["/dev/fd/3", "--fw-path", "/opt/fw/fw", "--portable"].map(std::ffi::OsString::from)
         );
     }
 

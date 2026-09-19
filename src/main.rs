@@ -19,8 +19,6 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tokio::net::windows::named_pipe::NamedPipeClient;
-
 use cli::{Cli, Invocation};
 use config::DAEMON_START_TIMEOUT;
 use error::{FwError, Result};
@@ -28,8 +26,7 @@ use ipc::framing::{read_frame, write_frame};
 use ipc::protocol::{
     ClientMessage, Envelope, ServerMessage, StopSelector as ProtocolStopSelector, TerminateReason,
 };
-use ipc::windows;
-use platform::windows::{NamedMutex, UserObjectNames, spawn_daemon};
+use platform::RuntimeScope;
 use ui::{
     PanelLayout, StartupMode, StartupProgress, Statistics, StatisticsRenderer, terminal_width,
     write_info,
@@ -71,7 +68,7 @@ fn init_tracing() {
 async fn dispatch(invocation: Invocation) -> Result<()> {
     match invocation {
         Invocation::Daemon => daemon::run().await,
-        Invocation::Setup => setup::run().await,
+        Invocation::Setup { portable } => setup::run(portable).await,
         Invocation::Start { port, slug } => run_start(port, slug).await,
         Invocation::List => run_list().await,
         Invocation::Stop { selector } => {
@@ -86,8 +83,8 @@ async fn dispatch(invocation: Invocation) -> Result<()> {
 }
 
 async fn run_start(port: u16, slug: Option<String>) -> Result<()> {
-    let names = UserObjectNames::current()?;
-    let initial = windows::connect(&names.pipe);
+    let scope = RuntimeScope::current()?;
+    let initial = ipc::connect(scope.endpoint()).await;
     let mode = if initial.is_ok() {
         StartupMode::ConnectingToDaemon
     } else {
@@ -98,7 +95,7 @@ async fn run_start(port: u16, slug: Option<String>) -> Result<()> {
     let result = async {
         let mut pipe = match initial {
             Ok(pipe) => pipe,
-            Err(_) => start_and_connect(&names).await?,
+            Err(_) => start_and_connect(&scope).await?,
         };
         write_frame(
             &mut pipe,
@@ -144,17 +141,17 @@ async fn run_start(port: u16, slug: Option<String>) -> Result<()> {
     run_owner_session(pipe, session_id, port, &public_url).await
 }
 
-async fn start_and_connect(names: &UserObjectNames) -> Result<NamedPipeClient> {
-    // Validate the exact sibling installation before creating any background
-    // service process, preserving actionable path errors for the foreground.
+async fn start_and_connect(scope: &RuntimeScope) -> Result<ipc::ClientConnection> {
+    // Validate the selected user or portable configuration before creating any
+    // background service process, preserving actionable path errors for the foreground.
     let paths = cloudflare_config::InstallPaths::resolve()?;
     cloudflare_config::preflight_validate(&paths)?;
-    let _startup_mutex = NamedMutex::acquire_startup(&names.startup_mutex)?;
-    if let Ok(pipe) = windows::connect(&names.pipe) {
+    let _startup_guard = scope.acquire_startup()?;
+    if let Ok(pipe) = ipc::connect(scope.endpoint()).await {
         return Ok(pipe);
     }
 
-    let mut child = spawn_daemon(&paths.fw_executable)?;
+    let mut child = platform::spawn_daemon(&paths.fw_executable)?;
     let stderr = child
         .stderr
         .take()
@@ -162,7 +159,7 @@ async fn start_and_connect(names: &UserObjectNames) -> Result<NamedPipeClient> {
     let startup_error = capture_daemon_stderr(stderr);
     let deadline = Instant::now() + DAEMON_START_TIMEOUT;
     loop {
-        if let Ok(pipe) = windows::connect(&names.pipe) {
+        if let Ok(pipe) = ipc::connect(scope.endpoint()).await {
             return Ok(pipe);
         }
         if let Some(status) = child.try_wait()? {
@@ -216,7 +213,7 @@ fn daemon_exit_error(status: ExitStatus, startup_error: Receiver<String>) -> FwE
 }
 
 async fn run_owner_session(
-    mut pipe: NamedPipeClient,
+    mut pipe: ipc::ClientConnection,
     session_id: u64,
     port: u16,
     public_url: &str,
@@ -286,7 +283,7 @@ async fn run_owner_session(
     }
 }
 
-async fn unregister(pipe: &mut NamedPipeClient, session_id: u64) -> Result<()> {
+async fn unregister(pipe: &mut ipc::ClientConnection, session_id: u64) -> Result<()> {
     write_frame(
         pipe,
         &Envelope::new(Some(2), ClientMessage::Unregister { session_id }),
@@ -305,8 +302,8 @@ async fn unregister(pipe: &mut NamedPipeClient, session_id: u64) -> Result<()> {
 }
 
 async fn run_list() -> Result<()> {
-    let names = UserObjectNames::current()?;
-    let Ok(mut pipe) = windows::connect(&names.pipe) else {
+    let scope = RuntimeScope::current()?;
+    let Ok(mut pipe) = ipc::connect(scope.endpoint()).await else {
         println!("No active forwards.");
         return Ok(());
     };
@@ -346,8 +343,10 @@ async fn run_list() -> Result<()> {
 }
 
 async fn run_stop(selector: ProtocolStopSelector) -> Result<()> {
-    let names = UserObjectNames::current()?;
-    let mut pipe = windows::connect(&names.pipe).map_err(|_| FwError::NoActiveForwards)?;
+    let scope = RuntimeScope::current()?;
+    let mut pipe = ipc::connect(scope.endpoint())
+        .await
+        .map_err(|_| FwError::NoActiveForwards)?;
     match request(&mut pipe, ClientMessage::Stop { selector }).await? {
         ServerMessage::Stopped { route } => {
             println!(
@@ -364,8 +363,8 @@ async fn run_stop(selector: ProtocolStopSelector) -> Result<()> {
 }
 
 async fn run_kill() -> Result<()> {
-    let names = UserObjectNames::current()?;
-    let Ok(mut pipe) = windows::connect(&names.pipe) else {
+    let scope = RuntimeScope::current()?;
+    let Ok(mut pipe) = ipc::connect(scope.endpoint()).await else {
         println!("Nothing to stop.");
         return Ok(());
     };
@@ -388,7 +387,10 @@ async fn run_kill() -> Result<()> {
     }
 }
 
-async fn request(pipe: &mut NamedPipeClient, message: ClientMessage) -> Result<ServerMessage> {
+async fn request(
+    pipe: &mut ipc::ClientConnection,
+    message: ClientMessage,
+) -> Result<ServerMessage> {
     write_frame(pipe, &Envelope::new(Some(1), message)).await?;
     let response: Envelope<ServerMessage> = read_frame(pipe).await?;
     Ok(response.message)

@@ -4,7 +4,10 @@ pub const LOOPBACK_HOST: &str = "127.0.0.1";
 pub const MIN_PROXY_PORT: u16 = 10_000;
 pub const MAX_PROXY_PORT: u16 = 65_535;
 pub const CLOUDFLARE_DIRECTORY: &str = "cf";
+#[cfg(windows)]
 pub const CLOUDFLARED_FILENAME: &str = "cloudflared.exe";
+#[cfg(unix)]
+pub const CLOUDFLARED_FILENAME: &str = "cloudflared";
 pub const CLOUDFLARE_CONFIG_FILENAME: &str = "config.yml";
 pub const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DAEMON_IDLE_TIMEOUT: Duration = Duration::from_secs(2);

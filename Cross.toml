@@ -1,0 +1,2 @@
+[build.env]
+passthrough = ["FW_APP_VERSION", "FW_SETUP_SCRIPT_SHA"]

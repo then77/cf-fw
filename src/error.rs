@@ -14,7 +14,7 @@ pub enum FwError {
     #[error("No active forwards")]
     NoActiveForwards,
     #[error(
-        "The cf directory was not found beside {executable_name}\nexpected: {path}{setup_hint}",
+        "The cf directory for {executable_name} was not found\nexpected: {path}{setup_hint}",
         path = .path.display(),
         setup_hint = format_setup_hint(*.setup_eligible, .executable_name)
     )]
@@ -23,7 +23,7 @@ pub enum FwError {
         path: PathBuf,
         setup_eligible: bool,
     },
-    #[error("{name} was not found in the cf directory beside {executable_name}\nexpected: {path}", path = .path.display())]
+    #[error("{name} was not found in the cf directory for {executable_name}\nexpected: {path}", path = .path.display())]
     MissingSibling {
         name: &'static str,
         executable_name: String,
@@ -132,7 +132,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("cf directory beside renamed-fw.exe")
+                .contains("cf directory for renamed-fw.exe")
         );
     }
 }
