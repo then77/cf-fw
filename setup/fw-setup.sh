@@ -76,20 +76,46 @@ welcome() {
     printf '%s\n\n' 'Additional configuration prompts may appear depending on your selections.'
 }
 
+shell_usage() {
+    printf '%s\n' 'Usage: fw-setup.sh --fw-path <absolute-path> [--portable]' >&2
+}
+
 portable=0
 fw_path=''
 expect_fw_path=0
 for bootstrap_arg do
     if [ "$expect_fw_path" -eq 1 ]; then
+        case $bootstrap_arg in
+            --*) shell_error '--fw-path requires a value.'; shell_usage; exit 2 ;;
+        esac
         fw_path=$bootstrap_arg
         expect_fw_path=0
         continue
     fi
     case $bootstrap_arg in
         --fw-path) expect_fw_path=1 ;;
+        --fw-path=*) fw_path=${bootstrap_arg#--fw-path=} ;;
         --portable) portable=1 ;;
+        *) shell_error "Unknown argument: $bootstrap_arg"; shell_usage; exit 2 ;;
     esac
 done
+if [ "$expect_fw_path" -eq 1 ] || [ -z "$fw_path" ]; then
+    shell_error '--fw-path is required.'
+    shell_usage
+    exit 2
+fi
+case $fw_path in
+    /*) ;;
+    *) shell_error '--fw-path must be an absolute path.'; shell_usage; exit 2 ;;
+esac
+if [ ! -f "$fw_path" ]; then
+    shell_error "FW executable was not found: $fw_path"
+    exit 1
+fi
+if [ ! -x "$fw_path" ]; then
+    shell_error "FW path is not executable: $fw_path"
+    exit 1
+fi
 
 welcome
 install_manager=''
@@ -302,6 +328,9 @@ class Console:
     ERROR_LABEL = "\033[41;1m"
     WARNING_LABEL = "\033[43;30;1m"
 
+    def __init__(self) -> None:
+        self.status_active = False
+
     @staticmethod
     def enabled(stream: Any) -> bool:
         return "NO_COLOR" not in os.environ and bool(getattr(stream, "isatty", lambda: False)())
@@ -338,10 +367,19 @@ class Console:
         self.line(message, style=self.BLUE_BOLD)
 
     def status(self, message: Any) -> None:
+        if self.status_active:
+            self.fail()
         self.line(message, style=self.BLUE_BOLD, sanitize=True, end="", flush=True)
+        self.status_active = True
 
     def ok(self, note: Any = "SUCCESS") -> None:
         self.line(f" {self.clean(note)}", style=self.GREEN_BOLD)
+        self.status_active = False
+
+    def fail(self) -> None:
+        if self.status_active:
+            self.line(" FAILED", style=self.ERROR_LABEL)
+            self.status_active = False
 
     def success(self, message: str) -> None:
         self.line(message, style=self.GREEN_BOLD)
@@ -362,10 +400,17 @@ class BoundedRedirect(urllib.request.HTTPRedirectHandler):
         count = int(getattr(req, "_fw_redirect_count", 0)) + 1
         if count > self.limit:
             raise SetupError("Too many HTTP redirects.")
-        source_scheme = urllib.parse.urlsplit(req.full_url).scheme.lower()
-        target_scheme = urllib.parse.urlsplit(newurl).scheme.lower()
+        source = urllib.parse.urlsplit(req.full_url)
+        target = urllib.parse.urlsplit(newurl)
+        source_scheme = source.scheme.lower()
+        target_scheme = target.scheme.lower()
         if source_scheme == "https" and target_scheme != "https":
             raise SetupError("Refusing an HTTPS redirect to a non-HTTPS URL.")
+        if req.get_header("Authorization"):
+            source_origin = (source_scheme, source.hostname, source.port or (443 if source_scheme == "https" else 80))
+            target_origin = (target_scheme, target.hostname, target.port or (443 if target_scheme == "https" else 80))
+            if source_origin != target_origin:
+                raise SetupError("Refusing to forward authorization credentials to a different origin.")
         redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
         if redirected is not None:
             setattr(redirected, "_fw_redirect_count", count)
@@ -532,11 +577,24 @@ class Setup:
             protocol_version = "HTTP/1.1"
             def log_message(self, _format: str, *args: Any) -> None:
                 return
-            def respond(self, status: int, title: str, message: str) -> None:
+            def respond(self, status: int, completed: bool, message: str) -> None:
+                if completed:
+                    title = "OAuth completed"
+                    heading = "OAuth completed"
+                    background = "#0f111a"
+                else:
+                    title = "OAuth Failed"
+                    heading = "OAuth failed"
+                    background = "#1a120f"
                 body = ("<!doctype html><html lang=en><head><meta charset=utf-8>"
                         "<meta name=viewport content='width=device-width,initial-scale=1'>"
-                        f"<title>{html.escape(title)}</title></head><body><main>"
-                        f"<h1>{html.escape(title)}</h1><p>{html.escape(message)}</p>"
+                        f"<title>{html.escape(title)}</title>"
+                        "<style>:root{color-scheme:light dark;font-family:system-ui,sans-serif}"
+                        f"body{{min-height:100vh;margin:0;display:grid;place-items:center;background:{background};color:#f9fafb}}"
+                        "main{max-width:32rem;padding:2rem;text-align:center}"
+                        "h1{font-size:clamp(2rem, 6vw, 3rem);margin:0 0 1rem}"
+                        "p{color:#9ca3af;line-height:1.6}</style></head><body><main>"
+                        f"<h1>{html.escape(heading)}</h1><p>{html.escape(message)}</p>"
                         "</main></body></html>").encode("utf-8")
                 self.send_response(status)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -548,25 +606,25 @@ class Setup:
                 parsed = urllib.parse.urlsplit(self.path)
                 if parsed.path != "/oauth/callback":
                     result["error"] = "Unexpected OAuth callback path."
-                    self.respond(404, "Not found", "Not found.")
+                    self.respond(404, False, "Not found.")
                     return
                 values = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
                 received_state = values.get("state", [""])[0]
                 if not hmac.compare_digest(received_state, expected_state):
                     result["error"] = "OAuth state validation failed."
-                    self.respond(400, "OAuth failed", "FW setup rejected this OAuth response.")
+                    self.respond(400, False, "FW setup rejected this OAuth response.")
                     return
                 if values.get("error"):
                     result["error"] = values.get("error_description", values["error"])[0]
-                    self.respond(400, "OAuth failed", result["error"])
+                    self.respond(400, False, result["error"])
                     return
                 code = values.get("code", [""])[0]
                 if not code:
                     result["error"] = "Cloudflare returned no authorization code."
-                    self.respond(400, "OAuth failed", result["error"])
+                    self.respond(400, False, result["error"])
                     return
                 result["code"] = code
-                self.respond(200, "OAuth completed", "You can close this window and return to FW Setup.")
+                self.respond(200, True, "You can close this window and return to FW Setup.")
 
         server: Optional[CallbackServer] = None
         for port in CALLBACK_PORTS:
@@ -611,25 +669,21 @@ class Setup:
                 raise SetupError(f"Cloudflare authorization did not grant every required permission: {', '.join(missing)}.")
         code = verifier = state = access_token = ""
 
-    def revoke_tokens(self) -> bool:
-        if not self.tokens:
-            return True
-        failures = 0
-        total = len(self.tokens)
+    def revoke_tokens(self) -> None:
         for token in self.tokens:
             form = urllib.parse.urlencode({"token": token, "client_id": OAUTH_CLIENT_ID}).encode("ascii")
             try:
                 self.request(REVOKE_ENDPOINT, "POST", form, {"Content-Type": "application/x-www-form-urlencoded"}, timeout=20)
-            except SetupError:
-                failures += 1
+            except Exception:
+                pass
         self.tokens.clear()
         self.access_token = None
-        if failures:
-            CONSOLE.warning(f"Cloudflare OAuth token revocation failed for {failures} of {total} token(s).")
-            CONSOLE.line("Revoke the FW authorization in the Cloudflare dashboard before retrying.", stream=sys.stderr)
-            return False
-        CONSOLE.success(f"Cloudflare OAuth token revocation succeeded for {total} token(s).")
-        return True
+
+    @staticmethod
+    def validate_release_configuration() -> None:
+        values = [OAUTH_CLIENT_ID, *BASE_SCOPES, WORKERS_SCOPE]
+        if any(not value.strip() or value.upper().startswith("REPLACE_") for value in values):
+            raise SetupError("This setup release is not configured: its Cloudflare OAuth client ID or scope values have not been replaced.")
 
     def validate_paths(self) -> None:
         if not self.fw_path.is_absolute():
@@ -896,6 +950,12 @@ class Setup:
         raise SetupError("The Worker domain was created, but Cloudflare did not create the requested wildcard certificate. Use Advanced Certificate Manager and try again.")
 
     def start_test_server(self) -> int:
+        class TestServer(http.server.HTTPServer):
+            def get_request(inner_self) -> Tuple[socket.socket, Any]:
+                connection, address = super().get_request()
+                connection.settimeout(10)
+                return connection, address
+
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, _format: str, *args: Any) -> None:
                 return
@@ -906,7 +966,7 @@ class Setup:
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
-        self.test_server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.test_server = TestServer(("127.0.0.1", 0), Handler)
         self.test_thread = threading.Thread(target=self.test_server.serve_forever, daemon=True)
         self.test_thread.start()
         port = self.test_server.server_port
@@ -917,21 +977,24 @@ class Setup:
 
     def stop_processes(self) -> None:
         if self.fw_process and self.fw_process.poll() is None:
-            with contextlib.suppress(ProcessLookupError):
+            with contextlib.suppress(OSError):
                 os.killpg(self.fw_process.pid, signal.SIGTERM)
             try:
                 self.fw_process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                with contextlib.suppress(ProcessLookupError):
+            except (OSError, subprocess.TimeoutExpired):
+                with contextlib.suppress(OSError):
                     os.killpg(self.fw_process.pid, signal.SIGKILL)
-                with contextlib.suppress(subprocess.TimeoutExpired):
+                with contextlib.suppress(OSError, subprocess.TimeoutExpired):
                     self.fw_process.wait(timeout=2)
         self.fw_process = None
         if self.test_server:
-            self.test_server.shutdown()
-            self.test_server.server_close()
+            with contextlib.suppress(Exception):
+                self.test_server.shutdown()
+            with contextlib.suppress(Exception):
+                self.test_server.server_close()
             if self.test_thread:
-                self.test_thread.join(timeout=5)
+                with contextlib.suppress(Exception):
+                    self.test_thread.join(timeout=5)
         self.test_server = None
         self.test_thread = None
 
@@ -1003,23 +1066,34 @@ class Setup:
         if self.access_token:
             operations = []
             if self.dns_record_id and self.zone_id:
-                operations.append((f"/zones/{self.zone_id}/dns_records/{self.dns_record_id}", "DNS record"))
+                operations.append(f"/zones/{self.zone_id}/dns_records/{self.dns_record_id}")
             if self.tunnel_id and self.account_id:
-                operations.append((f"/accounts/{self.account_id}/cfd_tunnel/{self.tunnel_id}", "tunnel"))
+                operations.append(f"/accounts/{self.account_id}/cfd_tunnel/{self.tunnel_id}")
             if self.worker_domain_id and self.account_id:
-                operations.append((f"/accounts/{self.account_id}/workers/domains/{self.worker_domain_id}", "Worker domain"))
+                operations.append(f"/accounts/{self.account_id}/workers/domains/{self.worker_domain_id}")
             if self.worker_created and self.worker_name and self.account_id:
-                operations.append((f"/accounts/{self.account_id}/workers/scripts/{self.worker_name}", "Worker"))
-            for path, label in operations:
+                operations.append(f"/accounts/{self.account_id}/workers/scripts/{self.worker_name}")
+            for path in operations:
                 try:
                     self.cf_api("DELETE", path)
-                except Exception as error:
-                    CONSOLE.warning(f"Rollback could not delete the Cloudflare {label}: {error}")
+                except Exception:
+                    pass
         for path in reversed(self.created_files + self.staged_files):
             with contextlib.suppress(OSError):
                 path.unlink()
 
+    def recover(self) -> None:
+        try:
+            self.rollback()
+        except BaseException:
+            pass
+        try:
+            self.revoke_tokens()
+        except BaseException:
+            pass
+
     def run(self) -> None:
+        self.validate_release_configuration()
         self.validate_paths()
         self.artifact()
         setup_hex = secrets.token_hex(2)
@@ -1139,16 +1213,17 @@ def main() -> int:
         setup.run()
         return 0
     except KeyboardInterrupt:
-        CONSOLE.line(stream=sys.stderr)
-        CONSOLE.error("Setup was interrupted; rolling back.")
-        setup.rollback()
-        setup.revoke_tokens()
+        with contextlib.suppress(Exception):
+            CONSOLE.fail()
+            CONSOLE.error("Setup was interrupted; rolling back.")
+        setup.recover()
         return 130
     except Exception as error:
-        setup.rollback()
-        setup.revoke_tokens()
-        CONSOLE.line(stream=sys.stderr)
-        CONSOLE.error(error)
+        with contextlib.suppress(Exception):
+            CONSOLE.fail()
+        setup.recover()
+        with contextlib.suppress(Exception):
+            CONSOLE.error(error)
         return 1
     finally:
         setup.cleanup_local()
