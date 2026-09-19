@@ -68,7 +68,7 @@ fn init_tracing() {
 async fn dispatch(invocation: Invocation) -> Result<()> {
     match invocation {
         Invocation::Daemon => daemon::run().await,
-        Invocation::Setup => setup::run().await,
+        Invocation::Setup { portable } => setup::run(portable).await,
         Invocation::Start { port, slug } => run_start(port, slug).await,
         Invocation::List => run_list().await,
         Invocation::Stop { selector } => {
@@ -142,8 +142,8 @@ async fn run_start(port: u16, slug: Option<String>) -> Result<()> {
 }
 
 async fn start_and_connect(scope: &RuntimeScope) -> Result<ipc::ClientConnection> {
-    // Validate the exact sibling installation before creating any background
-    // service process, preserving actionable path errors for the foreground.
+    // Validate the selected user or portable configuration before creating any
+    // background service process, preserving actionable path errors for the foreground.
     let paths = cloudflare_config::InstallPaths::resolve()?;
     cloudflare_config::preflight_validate(&paths)?;
     let _startup_guard = scope.acquire_startup()?;

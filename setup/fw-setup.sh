@@ -33,6 +33,16 @@ shell_warning() {
     fi
 }
 
+portable_warning() {
+    if [ "$stdout_color" -eq 1 ]; then
+        printf '\033[43;30;1m WARN \033[0m Setup will store FW config in '
+        style_stdout '1' "$1/"
+    else
+        printf ' WARN  Setup will store FW config in %s/' "$1"
+    fi
+    printf '%s\n' " instead of $2/. This is intended for portable setup mode and is not recommended for normal use. Continue if you know what you're doing."
+}
+
 shell_prompt() {
     style_stdout '34;1' "$1"
 }
@@ -66,6 +76,23 @@ welcome() {
     printf '%s\n\n' 'Additional configuration prompts may appear depending on your selections.'
 }
 
+portable=0
+self_test=0
+fw_path=''
+expect_fw_path=0
+for bootstrap_arg do
+    if [ "$expect_fw_path" -eq 1 ]; then
+        fw_path=$bootstrap_arg
+        expect_fw_path=0
+        continue
+    fi
+    case $bootstrap_arg in
+        --fw-path) expect_fw_path=1 ;;
+        --portable) portable=1 ;;
+        --self-test) self_test=1 ;;
+    esac
+done
+
 welcome
 install_manager=''
 install_package=''
@@ -84,6 +111,10 @@ if command -v python3 >/dev/null 2>&1; then
         exit 1
     fi
 else
+    if [ "$self_test" -eq 1 ]; then
+        shell_error '--self-test requires Python 3.9 or newer and never installs it.'
+        exit 1
+    fi
     printf '%s\n' 'Python 3.9 or newer is required only while FW setup runs.'
     printf '%s\n' 'Because python3 is absent, setup can install it now with your permission.'
     printf '%s\n' 'The installed Python package will remain available after setup finishes.'
@@ -173,9 +204,28 @@ else
     shell_warning "Python package $install_package installed by $install_manager will remain installed after FW setup."
 fi
 
-shell_prompt 'To start the setup process, press enter.'
-printf '\n'
-IFS= read -r bootstrap_start || { shell_error 'Input ended before setup started.'; exit 1; }
+if [ "$self_test" -eq 0 ] && [ "$portable" -eq 1 ]; then
+    fw_directory=${fw_path%/*}
+    [ -n "$fw_directory" ] || fw_directory='/'
+    portable_cf="${fw_directory%/}/cf"
+    case $(uname -s) in
+        Darwin) user_cf="${HOME:?HOME is required}/Library/Application Support/FW/cf" ;;
+        *)
+            case ${XDG_DATA_HOME:-} in
+                /*) user_cf="${XDG_DATA_HOME}/fw/cf" ;;
+                *) user_cf="${HOME:?HOME is required}/.local/share/fw/cf" ;;
+            esac
+            ;;
+    esac
+    portable_warning "$portable_cf" "$user_cf"
+    printf '\n'
+fi
+
+if [ "$self_test" -eq 0 ]; then
+    shell_prompt 'To start the setup process, press enter.'
+    printf '\n'
+    IFS= read -r bootstrap_start || { shell_error 'Input ended before setup started.'; exit 1; }
+fi
 
 python3 - "$@" 3<&0 <<'FW_SETUP_PYTHON'
 from __future__ import annotations
@@ -331,9 +381,26 @@ class BoundedRedirect(urllib.request.HTTPRedirectHandler):
 
 OPENER = urllib.request.build_opener(BoundedRedirect())
 
+def user_cf_directory() -> Path:
+    if platform.system() == "Darwin":
+        return Path.home() / "Library" / "Application Support" / "FW" / "cf"
+    xdg_data_home = os.environ.get("XDG_DATA_HOME")
+    if xdg_data_home and Path(xdg_data_home).is_absolute():
+        return Path(xdg_data_home) / "fw" / "cf"
+    return Path.home() / ".local" / "share" / "fw" / "cf"
+
+
+def select_cf_directory(fw_path: Path, portable: bool) -> Path:
+    adjacent = fw_path.parent / "cf"
+    if portable or adjacent.exists() or adjacent.is_symlink():
+        return adjacent
+    return user_cf_directory()
+
+
 class Setup:
-    def __init__(self, fw_path: Path) -> None:
+    def __init__(self, fw_path: Path, portable: bool) -> None:
         self.fw_path = fw_path
+        self.portable = portable
         self.temp = Path(tempfile.mkdtemp(prefix="fw-setup-"))
         os.chmod(self.temp, 0o700)
         self.tokens: List[str] = []
@@ -580,12 +647,12 @@ class Setup:
             raise SetupError(f"FW executable was not found: {self.fw_path}")
         if not os.access(self.fw_path, os.X_OK):
             raise SetupError(f"FW path is not executable: {self.fw_path}")
-        self.cf_dir = self.fw_path.parent / "cf"
+        self.cf_dir = select_cf_directory(self.fw_path, self.portable)
         if self.cf_dir.is_symlink():
             raise SetupError(f"FW will not use a symbolic-link configuration directory: {self.cf_dir}")
         if self.cf_dir.exists() and not self.cf_dir.is_dir():
             raise SetupError(f"FW configuration path is not a directory: {self.cf_dir}")
-        self.cf_dir.mkdir(mode=0o700, exist_ok=True)
+        self.cf_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.cf_dir, 0o700)
         probe = self.cf_dir / f".write-{secrets.token_hex(8)}"
         try:
@@ -1061,14 +1128,36 @@ class Setup:
         except EOFError:
             pass
 
+def self_test() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        fw_path = Path(directory) / "fw"
+        fw_path.write_bytes(b"test")
+        fw_path.chmod(0o755)
+        adjacent = fw_path.parent / "cf"
+        assert select_cf_directory(fw_path, True) == adjacent
+        assert select_cf_directory(fw_path, False) == user_cf_directory()
+        adjacent.mkdir()
+        assert select_cf_directory(fw_path, False) == adjacent
+    CONSOLE.success("fw-setup.sh self-test passed.")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="fw-setup.sh")
-    parser.add_argument("--fw-path", type=Path, required=True)
-    return parser.parse_args()
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--fw-path", type=Path)
+    group.add_argument("--self-test", action="store_true")
+    parser.add_argument("--portable", action="store_true")
+    args = parser.parse_args()
+    if args.self_test and args.portable:
+        parser.error("--portable requires --fw-path")
+    return args
 
 def main() -> int:
     args = parse_args()
-    setup = Setup(args.fw_path)
+    if args.self_test:
+        self_test()
+        return 0
+    setup = Setup(args.fw_path, args.portable)
     def interrupt(_signum: int, _frame: Any) -> None:
         raise KeyboardInterrupt
     for signal_name in ("SIGTERM", "SIGHUP"):

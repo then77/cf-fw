@@ -12,6 +12,52 @@ use tokio::process::{Child as TokioChild, Command as TokioCommand};
 use crate::error::{FwError, Result};
 use crate::platform::{executable_path, fnv1a_hex, installation_directory_hash_bytes};
 
+pub fn user_data_directory() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+
+    #[cfg(target_os = "macos")]
+    {
+        let home = home.ok_or_else(|| {
+            FwError::Other(
+                "HOME is not set; cannot locate the user application data directory".into(),
+            )
+        })?;
+        return Ok(absolute_user_path(home)?.join("Library/Application Support/FW"));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(path) = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from)
+            && path.is_absolute()
+        {
+            return Ok(path.join("fw"));
+        }
+        let home = home.ok_or_else(|| {
+            FwError::Other("HOME is not set; cannot locate the user data directory".into())
+        })?;
+        return Ok(absolute_user_path(home)?.join(".local/share/fw"));
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = home;
+        Err(FwError::Other(
+            "User data directories are supported only on Linux and macOS".into(),
+        ))
+    }
+}
+
+fn absolute_user_path(path: PathBuf) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Err(FwError::Other(format!(
+            "User home directory must be absolute: {}",
+            path.display()
+        )))
+    }
+}
+
 #[derive(Debug)]
 pub struct DaemonGuard {
     _file: File,

@@ -10,11 +10,11 @@ pub(crate) mod windows;
 #[cfg(unix)]
 pub(crate) use unix::ChildSupervisor;
 #[cfg(unix)]
-pub use unix::{RuntimeScope, atomic_replace, spawn_daemon};
+pub use unix::{RuntimeScope, atomic_replace, spawn_daemon, user_data_directory};
 #[cfg(windows)]
 pub(crate) use windows::ChildSupervisor;
 #[cfg(windows)]
-pub use windows::{RuntimeScope, atomic_replace, spawn_daemon};
+pub use windows::{RuntimeScope, atomic_replace, spawn_daemon, user_data_directory};
 
 pub fn executable_path() -> Result<PathBuf> {
     let executable = std::env::current_exe()?;

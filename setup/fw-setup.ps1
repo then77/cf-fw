@@ -10,9 +10,11 @@
     testing, rollback, and silent OAuth revocation.
 
 .PARAMETER FWPath
-    Absolute path to the FW executable that launched this script. Its parent
-    directory is used as the installation root, regardless of the executable's
-    filename.
+    Absolute path to the FW executable that launched this script.
+
+.PARAMETER Portable
+    Store FW configuration beside the executable instead of in the current
+    user's local application data directory.
 #>
 
 [CmdletBinding()]
@@ -20,6 +22,7 @@ param(
     [Parameter(Mandatory)]
     [ValidateNotNullOrEmpty()]
     [string] $FWPath,
+    [switch] $Portable,
     [string] $OAuthClientId = 'c5ddfa8b3cab280893b3bcc428dcc7c9',
     [string[]] $BaseScopes = @(
         'account-settings.read',
@@ -79,6 +82,7 @@ $script:Ansi = $hostSupportsAnsi -or ($null -ne $env:WT_SESSION) -or ($null -ne 
 $Esc = [char]27
 $Bold = "${Esc}[1m"
 $ErrorLabel = "${Esc}[41;1m"
+$WarningLabel = "${Esc}[43;30;1m"
 $Reset = "${Esc}[0m"
 
 function Write-Bold {
@@ -110,6 +114,21 @@ function Write-ErrorLine {
     } else {
         Write-Host " ERROR  $Message" -ForegroundColor Red
     }
+}
+
+function Write-PortableWarning {
+    param(
+        [Parameter(Mandatory)][string] $PortablePath,
+        [Parameter(Mandatory)][string] $UserPath
+    )
+    if ($script:Ansi) {
+        Write-Host "${WarningLabel} WARN ${Reset} Setup will store FW config in " -NoNewline
+    } else {
+        Write-Host ' WARN ' -ForegroundColor Black -BackgroundColor Yellow -NoNewline
+        Write-Host ' Setup will store FW config in ' -NoNewline
+    }
+    Write-Bold ($PortablePath.TrimEnd([char[]]'\/') + [IO.Path]::DirectorySeparatorChar) -NoNewline
+    Write-Host " instead of $($UserPath.TrimEnd([char[]]'\/') + [IO.Path]::DirectorySeparatorChar). This is intended for portable setup mode and is not recommended for normal use. Continue if you know what you're doing."
 }
 
 function Stop-StatusAnimation {
@@ -999,6 +1018,21 @@ function Assert-Configuration {
 }
 
 function Invoke-Setup {
+    if ($FWPath -notmatch '^(?:[A-Za-z]:[\\/]|\\\\)') { throw 'FWPath must be an absolute path.' }
+    $FWPath = [IO.Path]::GetFullPath($FWPath)
+    if (-not (Test-Path -LiteralPath $FWPath -PathType Leaf)) { throw "FW executable was not found: $FWPath" }
+    $root = [IO.Path]::GetDirectoryName($FWPath)
+    if ([string]::IsNullOrWhiteSpace($root)) { throw "FW executable directory could not be determined: $FWPath" }
+    $adjacentCfDirectory = Join-Path $root 'cf'
+    $localAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+    if ([string]::IsNullOrWhiteSpace($localAppData)) { throw 'The current user local application data directory could not be determined.' }
+    $userCfDirectory = Join-Path (Join-Path $localAppData 'FW') 'cf'
+    $cfDirectory = if ($Portable -or (Test-Path -LiteralPath $adjacentCfDirectory)) {
+        $adjacentCfDirectory
+    } else {
+        $userCfDirectory
+    }
+
     Clear-Host
     Write-Host 'Welcome to ' -NoNewline
     Write-Bold 'FW Automated Setup' -ForegroundColor Blue -NoNewline
@@ -1022,17 +1056,15 @@ function Invoke-Setup {
     Write-Host "You'll be asked to authorize with Cloudflare and configure your domain during setup."
     Write-Host 'Additional configuration prompts may appear depending on your selections.'
     Write-Host ''
+    if ($Portable) {
+        Write-PortableWarning -PortablePath $adjacentCfDirectory -UserPath $userCfDirectory
+        Write-Host ''
+    }
     Write-Host 'To start the setup process, press enter.'
     [void](Read-Host)
     Assert-Configuration
     $setupHex = New-RandomHex
 
-    if ($FWPath -notmatch '^(?:[A-Za-z]:[\\/]|\\\\)') { throw 'FWPath must be an absolute path.' }
-    $FWPath = [IO.Path]::GetFullPath($FWPath)
-    if (-not (Test-Path -LiteralPath $FWPath -PathType Leaf)) { throw "FW executable was not found: $FWPath" }
-    $root = [IO.Path]::GetDirectoryName($FWPath)
-    if ([string]::IsNullOrWhiteSpace($root)) { throw "FW executable directory could not be determined: $FWPath" }
-    $cfDirectory = Join-Path $root 'cf'
     New-Item -ItemType Directory -Path $cfDirectory -Force | Out-Null
     $probe = Join-Path $cfDirectory ('.write-' + [Guid]::NewGuid().ToString('N'))
     try { [IO.File]::WriteAllText($probe, 'test'); Remove-Item -LiteralPath $probe -Force } catch { throw "FW cannot write to $cfDirectory." }

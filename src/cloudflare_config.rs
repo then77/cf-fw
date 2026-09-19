@@ -36,8 +36,13 @@ impl InstallPaths {
     }
 
     pub fn from_executable(fw_executable: PathBuf) -> Result<Self> {
-        let install_dir = executable_directory_from(&fw_executable)?;
-        let cloudflare_dir = install_dir.join(CLOUDFLARE_DIRECTORY);
+        let executable_dir = executable_directory_from(&fw_executable)?;
+        let cloudflare_dir =
+            select_cloudflare_directory(&executable_dir, crate::platform::user_data_directory)?;
+        let install_dir = cloudflare_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or(FwError::InvalidExecutableDirectory)?;
         let cloudflared = cloudflare_dir.join(CLOUDFLARED_FILENAME);
         let cloudflare_config = cloudflare_dir.join(CLOUDFLARE_CONFIG_FILENAME);
 
@@ -56,6 +61,18 @@ impl InstallPaths {
             cloudflared,
             cloudflare_config,
         })
+    }
+}
+
+fn select_cloudflare_directory(
+    install_dir: &Path,
+    user_data_directory: impl FnOnce() -> Result<PathBuf>,
+) -> Result<PathBuf> {
+    let adjacent = install_dir.join(CLOUDFLARE_DIRECTORY);
+    if adjacent.try_exists()? {
+        Ok(adjacent)
+    } else {
+        Ok(user_data_directory()?.join(CLOUDFLARE_DIRECTORY))
     }
 }
 
@@ -79,7 +96,7 @@ pub fn preflight_validate(paths: &InstallPaths) -> Result<()> {
 
 /// Normalizes, validates, and atomically installs the managed Cloudflare config.
 ///
-/// Both files in the sibling `cf` directory must already have been validated
+/// Both files in the selected `cf` directory must already have been validated
 /// through [`InstallPaths`].
 /// The original config remains untouched unless the official validator accepts
 /// the complete temporary candidate.
@@ -342,6 +359,39 @@ fn atomic_replace(source: &Path, destination: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configuration_directory_prefers_an_existing_adjacent_directory() {
+        let install_dir = std::env::temp_dir().join(format!(
+            "fw-config-path-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let adjacent = install_dir.join(CLOUDFLARE_DIRECTORY);
+        fs::create_dir_all(&adjacent).unwrap();
+
+        assert_eq!(
+            select_cloudflare_directory(&install_dir, || panic!("user data must stay lazy"))
+                .unwrap(),
+            adjacent
+        );
+        fs::remove_dir_all(install_dir).unwrap();
+    }
+
+    #[test]
+    fn configuration_directory_uses_user_data_when_adjacent_is_absent() {
+        let install_dir = std::env::temp_dir().join(format!(
+            "fw-config-path-missing-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let user_data = PathBuf::from("user-data");
+
+        assert_eq!(
+            select_cloudflare_directory(&install_dir, || Ok(user_data.clone())).unwrap(),
+            user_data.join(CLOUDFLARE_DIRECTORY)
+        );
+    }
 
     fn parsed(input: &str, port: u16) -> Value {
         serde_yml::from_str(&normalize_yaml(input, port).unwrap().yaml).unwrap()

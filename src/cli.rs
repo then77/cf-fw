@@ -25,15 +25,19 @@ pub struct Cli {
     pub daemon: bool,
 
     /// Download, verify, and run the setup script.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, conflicts_with = "daemon")]
     pub setup: bool,
+
+    /// Store setup files beside the FW executable.
+    #[arg(long, conflicts_with = "port")]
+    pub portable: bool,
 
     /// Custom public slug. Used only when starting a forward.
     #[arg(short, long, global = true)]
     pub slug: Option<String>,
 
     /// Shorthand for `fw start <port>`.
-    #[arg(value_parser = parse_port)]
+    #[arg(value_parser = parse_port, conflicts_with = "setup")]
     pub port: Option<u16>,
 
     #[command(subcommand)]
@@ -60,7 +64,7 @@ pub enum Command {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Invocation {
     Daemon,
-    Setup,
+    Setup { portable: bool },
     Start { port: u16, slug: Option<String> },
     List,
     Stop { selector: StopSelector },
@@ -79,6 +83,7 @@ pub enum StopSelector {
 pub enum ValidationError {
     DaemonWithCommand,
     SetupWithCommand,
+    PortableWithoutSetup,
     ConflictingModes,
     ShorthandWithSubcommand,
     SlugWithoutStart,
@@ -96,6 +101,7 @@ impl fmt::Display for ValidationError {
             Self::SetupWithCommand => {
                 f.write_str("--setup cannot be combined with a port or subcommand")
             }
+            Self::PortableWithoutSetup => f.write_str("--portable requires --setup"),
             Self::ConflictingModes => f.write_str("--setup and --daemon cannot be used together"),
             Self::ShorthandWithSubcommand => {
                 f.write_str("a shorthand port cannot be combined with a subcommand")
@@ -127,6 +133,9 @@ impl Cli {
 
     /// Convert raw arguments into one normalized dispatch value.
     pub fn normalize(self) -> Result<Invocation, ValidationError> {
+        if self.portable && !self.setup {
+            return Err(ValidationError::PortableWithoutSetup);
+        }
         if self.daemon && self.setup {
             return Err(ValidationError::ConflictingModes);
         }
@@ -147,7 +156,9 @@ impl Cli {
             }
 
             // As in daemon mode, recognized non-command options are ignored.
-            return Ok(Invocation::Setup);
+            return Ok(Invocation::Setup {
+                portable: self.portable,
+            });
         }
 
         if self.port.is_some() && self.command.is_some() {
@@ -265,9 +276,11 @@ fn invalid_slug(value: &str, reason: &'static str) -> ValidationError {
 }
 
 fn clap_error(error: ValidationError) -> clap::Error {
+    let portable_without_setup = matches!(error, ValidationError::PortableWithoutSetup);
     let kind = match error {
         ValidationError::DaemonWithCommand
         | ValidationError::SetupWithCommand
+        | ValidationError::PortableWithoutSetup
         | ValidationError::ConflictingModes
         | ValidationError::ShorthandWithSubcommand
         | ValidationError::SlugWithoutStart => ErrorKind::ArgumentConflict,
@@ -277,7 +290,11 @@ fn clap_error(error: ValidationError) -> clap::Error {
         }
     };
 
-    Cli::command().error(kind, error.to_string())
+    let mut command = Cli::command();
+    if portable_without_setup {
+        command = command.override_usage("fw --setup [--portable]");
+    }
+    command.error(kind, error.to_string())
 }
 
 #[cfg(test)]
@@ -378,10 +395,17 @@ mod tests {
 
     #[test]
     fn setup_matches_daemon_validation_and_ignores_slug() {
-        assert_eq!(parse(&["fw", "--setup"]).unwrap(), Invocation::Setup);
+        assert_eq!(
+            parse(&["fw", "--setup"]).unwrap(),
+            Invocation::Setup { portable: false }
+        );
         assert_eq!(
             parse(&["fw", "--slug", "ignored", "--setup"]).unwrap(),
-            Invocation::Setup
+            Invocation::Setup { portable: false }
+        );
+        assert_eq!(
+            parse(&["fw", "--setup", "--portable"]).unwrap(),
+            Invocation::Setup { portable: true }
         );
 
         for args in [
@@ -393,7 +417,7 @@ mod tests {
         ] {
             let error = parse(args).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::ArgumentConflict, "{args:?}");
-            assert!(error.to_string().contains("--setup cannot be combined"));
+            assert!(error.to_string().contains("--setup"));
         }
     }
 
@@ -401,6 +425,16 @@ mod tests {
     fn setup_and_daemon_are_mutually_exclusive() {
         let error = parse(&["fw", "--setup", "--daemon"]).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn portable_requires_setup() {
+        let error = parse(&["fw", "--portable"]).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+        let rendered = error.to_string();
+        assert!(rendered.contains("--setup"));
+        assert!(!rendered.contains("[PORT]"));
+        assert!(!rendered.contains("tip: to pass '--portable' as a value"));
     }
 
     #[test]

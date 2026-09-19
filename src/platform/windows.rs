@@ -32,6 +32,23 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::error::{FwError, Result};
 
+pub fn user_data_directory() -> Result<PathBuf> {
+    let path = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            FwError::Other(
+                "LOCALAPPDATA is not set; cannot locate the user application data directory".into(),
+            )
+        })?;
+    if !path.is_absolute() {
+        return Err(FwError::Other(format!(
+            "LOCALAPPDATA must be absolute: {}",
+            path.display()
+        )));
+    }
+    Ok(path.join("FW"))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UserObjectNames {
     pub sid_hash: String,

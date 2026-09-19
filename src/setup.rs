@@ -88,8 +88,8 @@ pub(crate) fn is_eligible() -> bool {
     SetupMetadata::embedded().is_ok()
 }
 
-pub async fn run() -> Result<()> {
-    match run_inner().await {
+pub async fn run(portable: bool) -> Result<()> {
+    match run_inner(portable).await {
         Ok(()) => Ok(()),
         Err(error) => {
             if write_status(
@@ -107,7 +107,7 @@ pub async fn run() -> Result<()> {
     }
 }
 
-async fn run_inner() -> Result<()> {
+async fn run_inner(portable: bool) -> Result<()> {
     let metadata = SetupMetadata::embedded()?;
     let url = metadata.url();
 
@@ -156,7 +156,7 @@ async fn run_inner() -> Result<()> {
         "Launching script...",
     )?;
     let fw_path = crate::platform::executable_path()?;
-    let mut child = spawn_setup(&script_path, &fw_path, &mut script).await?;
+    let mut child = spawn_setup(&script_path, &fw_path, portable, &mut script).await?;
     let status = child.wait().await?;
 
     if !status.success() {
@@ -254,18 +254,23 @@ fn verify_script(script: &mut File, expected_sha256: &str) -> Result<()> {
 }
 
 #[cfg(windows)]
-async fn spawn_setup(script: &Path, fw_path: &Path, _verified_script: &mut File) -> Result<Child> {
-    match powershell_command("pwsh.exe", script, fw_path).spawn() {
+async fn spawn_setup(
+    script: &Path,
+    fw_path: &Path,
+    portable: bool,
+    _verified_script: &mut File,
+) -> Result<Child> {
+    match powershell_command("pwsh.exe", script, fw_path, portable).spawn() {
         Ok(child) => Ok(child),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            Ok(powershell_command("powershell.exe", script, fw_path).spawn()?)
+            Ok(powershell_command("powershell.exe", script, fw_path, portable).spawn()?)
         }
         Err(error) => Err(error.into()),
     }
 }
 
 #[cfg(windows)]
-fn powershell_command(program: &str, script: &Path, fw_path: &Path) -> Command {
+fn powershell_command(program: &str, script: &Path, fw_path: &Path, portable: bool) -> Command {
     let mut command = Command::new(program);
     command
         .arg("-NoProfile")
@@ -274,7 +279,11 @@ fn powershell_command(program: &str, script: &Path, fw_path: &Path) -> Command {
         .arg("-File")
         .arg(script)
         .arg("-FWPath")
-        .arg(fw_path)
+        .arg(fw_path);
+    if portable {
+        command.arg("-Portable");
+    }
+    command
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -282,22 +291,31 @@ fn powershell_command(program: &str, script: &Path, fw_path: &Path) -> Command {
 }
 
 #[cfg(unix)]
-async fn spawn_setup(_script: &Path, fw_path: &Path, verified_script: &mut File) -> Result<Child> {
+async fn spawn_setup(
+    _script: &Path,
+    fw_path: &Path,
+    portable: bool,
+    verified_script: &mut File,
+) -> Result<Child> {
     let script_fd = verified_script.as_raw_fd();
-    unix_setup_command(fw_path, script_fd)
+    unix_setup_command(fw_path, portable, script_fd)
         .spawn()
         .map_err(Into::into)
 }
 
 #[cfg(unix)]
-fn unix_setup_command(fw_path: &Path, script_fd: std::os::fd::RawFd) -> Command {
+fn unix_setup_command(fw_path: &Path, portable: bool, script_fd: std::os::fd::RawFd) -> Command {
     const CHILD_SCRIPT_FD: libc::c_int = 3;
 
     let mut command = Command::new("/bin/sh");
     command
         .arg(format!("/dev/fd/{CHILD_SCRIPT_FD}"))
         .arg("--fw-path")
-        .arg(fw_path)
+        .arg(fw_path);
+    if portable {
+        command.arg("--portable");
+    }
+    command
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -377,6 +395,7 @@ mod tests {
             "pwsh.exe",
             Path::new(r"C:\Temp\fw-setup-v1.ps1"),
             Path::new(r"D:\Programs\FW\renamed-fw.exe"),
+            true,
         )
         .as_std()
         .get_args()
@@ -393,6 +412,7 @@ mod tests {
                 r"C:\Temp\fw-setup-v1.ps1",
                 "-FWPath",
                 r"D:\Programs\FW\renamed-fw.exe",
+                "-Portable",
             ]
             .map(std::ffi::OsString::from)
         );
@@ -401,7 +421,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unix_shell_receives_verified_descriptor_and_absolute_fw_path() {
-        let command = unix_setup_command(Path::new("/opt/fw/fw"), 9);
+        let command = unix_setup_command(Path::new("/opt/fw/fw"), true, 9);
         let arguments = command
             .as_std()
             .get_args()
@@ -409,7 +429,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             arguments,
-            ["/dev/fd/3", "--fw-path", "/opt/fw/fw"].map(std::ffi::OsString::from)
+            ["/dev/fd/3", "--fw-path", "/opt/fw/fw", "--portable"].map(std::ffi::OsString::from)
         );
     }
 
