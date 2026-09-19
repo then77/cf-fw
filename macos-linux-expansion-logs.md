@@ -72,3 +72,10 @@ This file records checkpoints, skipped procedures, and validation limits for wor
 - The first macOS ARM64 package attempt failed only because GitHub's artifact service timed out all five `ListArtifacts` requests. Its build artifact had already uploaded successfully; rerunning the failed jobs cleared the infrastructure error without a code change.
 - The final assembly verified and uploaded all nine release files. `Create GitHub release` was skipped because publishing was disabled.
 - The `macos-15` Apple Silicon jobs received runner capacity and completed. No runner-capacity limitation remained in the successful run.
+
+## 2026-09-19 — Universal macOS installer validation completed
+
+- Dry-run workflow `35416602581` used `version=0.1.16` and `publish=no` from `feat/mac-linux` at `3ac7d40`.
+- The Intel and Apple Silicon binaries were combined into `fw-macos-setup-v0.1.16.pkg`; `pkgbuild` used package identifier `me.rlzy.fw` and the expanded package passed payload, executable, symlink, script, identifier, version, and runtime checks.
+- All native Windows, Linux, and macOS build and package jobs passed. No real failures or runner-capacity limitations occurred.
+- Final assembly verified and uploaded all ten release files as `complete-release-0.1.16`. `Create GitHub release` was skipped because publishing was disabled.
