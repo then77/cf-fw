@@ -72,50 +72,9 @@ for bootstrap_arg do
 done
 
 welcome
-python_installed=0
 install_manager=''
 install_package=''
 run_prefix=''
-case $(uname -s 2>/dev/null || printf unknown) in
-    Darwin) fw_cache_root=${HOME:?HOME is required}/Library/Caches/FW ;;
-    *) fw_cache_root=${XDG_CACHE_HOME:-${HOME:?HOME is required}/.cache}/fw ;;
-esac
-python_marker=$fw_cache_root/setup-python-package
-
-load_python_marker() {
-    [ "$is_self_test" -eq 0 ] || return 1
-    [ -e "$python_marker" ] || return 1
-    if [ -L "$python_marker" ] || [ ! -f "$python_marker" ]; then
-        shell_error "Refusing unsafe FW setup state file: $python_marker"
-        exit 1
-    fi
-    IFS=: read -r marker_manager marker_package marker_extra < "$python_marker" || {
-        shell_error "Could not read FW setup state file: $python_marker"
-        exit 1
-    }
-    [ -z "${marker_extra:-}" ] || marker_manager=''
-    case "$marker_manager:$marker_package" in
-        brew:python|apt-get:python3|dnf:python3|yum:python3|pacman:python|zypper:python3|apk:python3)
-            install_manager=$marker_manager
-            install_package=$marker_package
-            python_installed=1
-            return 0
-            ;;
-        *)
-            shell_error "FW setup state contains an unknown Python package; refusing automatic removal."
-            exit 1
-            ;;
-    esac
-}
-
-save_python_marker() {
-    mkdir -p "$fw_cache_root"
-    chmod 0700 "$fw_cache_root"
-    marker_temp=$fw_cache_root/.setup-python-package.$$
-    (umask 077; printf '%s:%s\n' "$install_manager" "$install_package" > "$marker_temp")
-    chmod 0600 "$marker_temp"
-    mv -f "$marker_temp" "$python_marker"
-}
 
 python_usable() {
     command -v python3 >/dev/null 2>&1 || return 1
@@ -129,25 +88,14 @@ if command -v python3 >/dev/null 2>&1; then
         printf '%s\n' 'FW setup did not replace or uninstall the existing Python installation.' >&2
         exit 1
     fi
-    if load_python_marker; then
-        shell_warning "FW setup previously installed $install_package with $install_manager; it will be removed only after setup succeeds."
-    fi
 else
-    if [ "$is_self_test" -eq 0 ] && [ -e "$python_marker" ]; then
-        if [ -L "$python_marker" ] || [ ! -f "$python_marker" ]; then
-            shell_error "Refusing unsafe FW setup state file: $python_marker"
-            exit 1
-        fi
-        shell_warning 'The recorded setup-only Python installation is no longer available; replacing the stale setup record.'
-        rm -f "$python_marker"
-    fi
     if [ "$is_self_test" -eq 1 ]; then
         shell_error '--self-test requires Python 3.9 or newer and never installs it.'
         exit 1
     fi
     printf '%s\n' 'Python 3.9 or newer is required only while FW setup runs.'
-    printf '%s\n' 'Because python3 is absent, setup can install it now and will automatically'
-    printf '%s\n' 'uninstall only that exact package after setup completes successfully.'
+    printf '%s\n' 'Because python3 is absent, setup can install it now with your permission.'
+    printf '%s\n' 'The installed Python package will remain available after setup finishes.'
     shell_prompt 'Continue setup? (Y/n) '
     IFS= read -r bootstrap_answer || bootstrap_answer='n'
     case $bootstrap_answer in ''|y|Y|yes|YES|Yes) ;; *) printf '%s\n' 'Setup stopped.'; exit 1 ;; esac
@@ -226,21 +174,18 @@ else
         shell_error "$install_manager could not install $install_package (exit $install_status)."
         exit "$install_status"
     fi
-    python_installed=1
-    save_python_marker
     if ! python_usable; then
         shell_error 'The installed python3 is missing or older than Python 3.9.'
-        printf 'The %s package %s was retained for inspection or rerun.\n' "$install_manager" "$install_package" >&2
+        printf 'The %s package %s was left installed for inspection or future use.\n' "$install_manager" "$install_package" >&2
         exit 1
     fi
+    shell_warning "Python package $install_package installed by $install_manager will remain installed after FW setup."
 fi
 
 if [ "$is_self_test" -eq 0 ]; then
     shell_prompt 'To start the setup process, press enter.'
     printf '\n'
-    if [ "$python_installed" -eq 0 ]; then
-        IFS= read -r bootstrap_start || { shell_error 'Input ended before setup started.'; exit 1; }
-    fi
+    IFS= read -r bootstrap_start || { shell_error 'Input ended before setup started.'; exit 1; }
 fi
 
 python3 - "$@" 3<&0 <<'FW_SETUP_PYTHON'
@@ -1206,42 +1151,4 @@ def main() -> int:
 if __name__ == "__main__":
     raise SystemExit(main())
 FW_SETUP_PYTHON
-setup_status=$?
-
-if [ "$python_installed" -eq 1 ]; then
-    if [ "$setup_status" -eq 0 ]; then
-        shell_status "Removing setup-only dependency $install_package installed by $install_manager..."
-        cleanup_status=0
-        case $install_manager in
-            brew) brew uninstall "$install_package" || cleanup_status=$? ;;
-            apt-get)
-                if [ -n "$run_prefix" ]; then sudo apt-get remove -y "$install_package" || cleanup_status=$?
-                else apt-get remove -y "$install_package" || cleanup_status=$?; fi ;;
-            dnf)
-                if [ -n "$run_prefix" ]; then sudo dnf remove -y "$install_package" || cleanup_status=$?
-                else dnf remove -y "$install_package" || cleanup_status=$?; fi ;;
-            yum)
-                if [ -n "$run_prefix" ]; then sudo yum remove -y "$install_package" || cleanup_status=$?
-                else yum remove -y "$install_package" || cleanup_status=$?; fi ;;
-            pacman)
-                if [ -n "$run_prefix" ]; then sudo pacman -R --noconfirm "$install_package" || cleanup_status=$?
-                else pacman -R --noconfirm "$install_package" || cleanup_status=$?; fi ;;
-            zypper)
-                if [ -n "$run_prefix" ]; then sudo zypper --non-interactive remove "$install_package" || cleanup_status=$?
-                else zypper --non-interactive remove "$install_package" || cleanup_status=$?; fi ;;
-            apk)
-                if [ -n "$run_prefix" ]; then sudo apk del "$install_package" || cleanup_status=$?
-                else apk del "$install_package" || cleanup_status=$?; fi ;;
-        esac
-        if [ "$cleanup_status" -ne 0 ]; then
-            shell_warning "Setup succeeded, but $install_manager could not remove $install_package (exit $cleanup_status)."
-            printf 'Run the corresponding %s remove/uninstall command for package %s manually; do not use autoremove.\n' "$install_manager" "$install_package" >&2
-            exit "$cleanup_status"
-        fi
-        rm -f "$python_marker"
-    else
-        shell_warning "Setup-only Python package $install_package installed by $install_manager was retained because setup did not complete successfully."
-        printf '%s\n' 'Rerun setup to continue; it will not uninstall this existing Python installation.' >&2
-    fi
-fi
-exit "$setup_status"
+exit $?
