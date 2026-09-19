@@ -77,7 +77,6 @@ welcome() {
 }
 
 portable=0
-self_test=0
 fw_path=''
 expect_fw_path=0
 for bootstrap_arg do
@@ -89,7 +88,6 @@ for bootstrap_arg do
     case $bootstrap_arg in
         --fw-path) expect_fw_path=1 ;;
         --portable) portable=1 ;;
-        --self-test) self_test=1 ;;
     esac
 done
 
@@ -111,10 +109,6 @@ if command -v python3 >/dev/null 2>&1; then
         exit 1
     fi
 else
-    if [ "$self_test" -eq 1 ]; then
-        shell_error '--self-test requires Python 3.9 or newer and never installs it.'
-        exit 1
-    fi
     printf '%s\n' 'Python 3.9 or newer is required only while FW setup runs.'
     printf '%s\n' 'Because python3 is absent, setup can install it now with your permission.'
     printf '%s\n' 'The installed Python package will remain available after setup finishes.'
@@ -204,7 +198,7 @@ else
     shell_warning "Python package $install_package installed by $install_manager will remain installed after FW setup."
 fi
 
-if [ "$self_test" -eq 0 ] && [ "$portable" -eq 1 ]; then
+if [ "$portable" -eq 1 ]; then
     fw_directory=${fw_path%/*}
     [ -n "$fw_directory" ] || fw_directory='/'
     portable_cf="${fw_directory%/}/cf"
@@ -221,11 +215,9 @@ if [ "$self_test" -eq 0 ] && [ "$portable" -eq 1 ]; then
     printf '\n'
 fi
 
-if [ "$self_test" -eq 0 ]; then
-    shell_prompt 'To start the setup process, press enter.'
-    printf '\n'
-    IFS= read -r bootstrap_start || { shell_error 'Input ended before setup started.'; exit 1; }
-fi
+shell_prompt 'To start the setup process, press enter.'
+printf '\n'
+IFS= read -r bootstrap_start || { shell_error 'Input ended before setup started.'; exit 1; }
 
 python3 - "$@" 3<&0 <<'FW_SETUP_PYTHON'
 from __future__ import annotations
@@ -1128,35 +1120,15 @@ class Setup:
         except EOFError:
             pass
 
-def self_test() -> None:
-    with tempfile.TemporaryDirectory() as directory:
-        fw_path = Path(directory) / "fw"
-        fw_path.write_bytes(b"test")
-        fw_path.chmod(0o755)
-        adjacent = fw_path.parent / "cf"
-        assert select_cf_directory(fw_path, True) == adjacent
-        assert select_cf_directory(fw_path, False) == user_cf_directory()
-        adjacent.mkdir()
-        assert select_cf_directory(fw_path, False) == adjacent
-    CONSOLE.success("fw-setup.sh self-test passed.")
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="fw-setup.sh")
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--fw-path", type=Path)
-    group.add_argument("--self-test", action="store_true")
+    parser.add_argument("--fw-path", type=Path, required=True)
     parser.add_argument("--portable", action="store_true")
-    args = parser.parse_args()
-    if args.self_test and args.portable:
-        parser.error("--portable requires --fw-path")
-    return args
+    return parser.parse_args()
 
 def main() -> int:
     args = parse_args()
-    if args.self_test:
-        self_test()
-        return 0
     setup = Setup(args.fw_path, args.portable)
     def interrupt(_signum: int, _frame: Any) -> None:
         raise KeyboardInterrupt
