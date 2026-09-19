@@ -57,6 +57,10 @@ jobs:
               shell: pwsh
               run: rustup target add i686-pc-windows-msvc x86_64-pc-windows-msvc
 
+            - name: Run Windows test suite
+              shell: pwsh
+              run: cargo test --locked --all-targets
+
             - name: Build Windows release binaries
               shell: pwsh
               env:
@@ -74,6 +78,20 @@ jobs:
                   Copy-Item -LiteralPath 'target/i686-pc-windows-msvc/release/fw.exe' -Destination "release-assets/fw-windows-portable-i386-v$($env:RELEASE_VERSION).exe"
                   Copy-Item -LiteralPath 'target/x86_64-pc-windows-msvc/release/fw.exe' -Destination "release-assets/fw-windows-portable-amd64-v$($env:RELEASE_VERSION).exe"
                   Copy-Item -LiteralPath 'setup/fw-setup.ps1' -Destination 'release-assets/fw-setup.ps1'
+
+            - name: Verify Windows setup entrypoint
+              shell: pwsh
+              env:
+                  RELEASE_VERSION: ${{ inputs.version }}
+              run: |
+                  $ErrorActionPreference = 'Stop'
+                  $expectedUrl = "https://github.com/then77/cf-fw/releases/download/$($env:RELEASE_VERSION)/fw-setup.ps1"
+                  foreach ($arch in @('i386', 'amd64')) {
+                      $binary = "release-assets/fw-windows-portable-$arch-v$($env:RELEASE_VERSION).exe"
+                      $output = 'n' | & $binary --setup 2>&1
+                      if ($LASTEXITCODE -ne 0) { throw "$binary --setup failed with exit code $LASTEXITCODE" }
+                      if (($output -join "`n") -notlike "*$expectedUrl*") { throw "$binary --setup omitted the expected URL" }
+                  }
 
             - name: Upload Windows build outputs
               uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -134,8 +152,9 @@ jobs:
                   if-no-files-found: error
                   retention-days: 3
 
-    test-linux:
-        name: Test Linux ${{ matrix.arch }}
+
+    build-linux:
+        name: Build Linux ${{ matrix.arch }}
         runs-on: ${{ matrix.runner }}
         permissions:
             contents: read
@@ -144,41 +163,11 @@ jobs:
             matrix:
                 include:
                     - arch: amd64
+                      target: x86_64-unknown-linux-musl
                       runner: ubuntu-24.04
                     - arch: arm64
-                      runner: ubuntu-24.04-arm
-
-        steps:
-            - name: Checkout selected revision
-              uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-              with:
-                  ref: ${{ github.sha }}
-                  persist-credentials: false
-
-            - name: Validate embedded Unix setup
-              run: |
-                  set -euo pipefail
-                  test -f setup/fw-setup.sh
-                  sh -n setup/fw-setup.sh
-                  sh setup/fw-setup.sh --self-test
-
-            - name: Run Linux test suite
-              run: cargo test --locked --all-targets
-
-    build-linux:
-        name: Build Linux ${{ matrix.arch }}
-        needs: test-linux
-        runs-on: ubuntu-24.04
-        permissions:
-            contents: read
-        strategy:
-            fail-fast: false
-            matrix:
-                include:
-                    - arch: amd64
-                      target: x86_64-unknown-linux-musl
-                    - arch: arm64
                       target: aarch64-unknown-linux-musl
+                      runner: ubuntu-24.04-arm
 
         steps:
             - name: Checkout selected revision
@@ -200,6 +189,9 @@ jobs:
                   sha="$(sha256sum setup/fw-setup.sh | cut -d ' ' -f 1)"
                   echo "setup_script_sha=$sha" >> "$GITHUB_OUTPUT"
                   echo "fw-setup.sh SHA-256: $sha"
+
+            - name: Run Linux test suite
+              run: cargo test --locked --all-targets
 
             - name: Install cross
               run: cargo install cross --locked --version 0.2.5
@@ -303,48 +295,8 @@ jobs:
                   if-no-files-found: error
                   retention-days: 3
 
-    test-macos:
-        name: Test macOS ${{ matrix.arch }}
-        runs-on: ${{ matrix.runner }}
-        permissions:
-            contents: read
-        strategy:
-            fail-fast: false
-            matrix:
-                include:
-                    - arch: amd64
-                      runner: macos-15-intel
-                    - arch: arm64
-                      runner: macos-15
-
-        steps:
-            - name: Checkout selected revision
-              uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-              with:
-                  ref: ${{ github.sha }}
-                  persist-credentials: false
-
-            - name: Verify native runner architecture
-              env:
-                  ARCH: ${{ matrix.arch }}
-              run: |
-                  set -euo pipefail
-                  machine="$(uname -m)"
-                  if [[ "$ARCH" == amd64 ]]; then test "$machine" = x86_64; else test "$machine" = arm64; fi
-
-            - name: Validate embedded Unix setup
-              run: |
-                  set -euo pipefail
-                  test -f setup/fw-setup.sh
-                  sh -n setup/fw-setup.sh
-                  sh setup/fw-setup.sh --self-test
-
-            - name: Run macOS test suite
-              run: cargo test --locked --all-targets
-
     build-macos:
         name: Build macOS ${{ matrix.arch }}
-        needs: test-macos
         runs-on: ${{ matrix.runner }}
         permissions:
             contents: read
@@ -366,6 +318,14 @@ jobs:
                   ref: ${{ github.sha }}
                   persist-credentials: false
 
+            - name: Verify native runner architecture
+              env:
+                  ARCH: ${{ matrix.arch }}
+              run: |
+                  set -euo pipefail
+                  machine="$(uname -m)"
+                  if [[ "$ARCH" == amd64 ]]; then test "$machine" = x86_64; else test "$machine" = arm64; fi
+
             - name: Validate release metadata
               id: metadata
               env:
@@ -379,6 +339,9 @@ jobs:
                   sha="$(shasum -a 256 setup/fw-setup.sh | cut -d ' ' -f 1)"
                   echo "setup_script_sha=$sha" >> "$GITHUB_OUTPUT"
                   echo "fw-setup.sh SHA-256: $sha"
+
+            - name: Run macOS test suite
+              run: cargo test --locked --all-targets
 
             - name: Install macOS Rust target
               run: rustup target add '${{ matrix.target }}'
