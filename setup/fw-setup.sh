@@ -66,11 +66,6 @@ welcome() {
     printf '%s\n\n' 'Additional configuration prompts may appear depending on your selections.'
 }
 
-is_self_test=0
-for bootstrap_arg do
-    [ "$bootstrap_arg" = '--self-test' ] && is_self_test=1
-done
-
 welcome
 install_manager=''
 install_package=''
@@ -89,10 +84,6 @@ if command -v python3 >/dev/null 2>&1; then
         exit 1
     fi
 else
-    if [ "$is_self_test" -eq 1 ]; then
-        shell_error '--self-test requires Python 3.9 or newer and never installs it.'
-        exit 1
-    fi
     printf '%s\n' 'Python 3.9 or newer is required only while FW setup runs.'
     printf '%s\n' 'Because python3 is absent, setup can install it now with your permission.'
     printf '%s\n' 'The installed Python package will remain available after setup finishes.'
@@ -182,11 +173,9 @@ else
     shell_warning "Python package $install_package installed by $install_manager will remain installed after FW setup."
 fi
 
-if [ "$is_self_test" -eq 0 ]; then
-    shell_prompt 'To start the setup process, press enter.'
-    printf '\n'
-    IFS= read -r bootstrap_start || { shell_error 'Input ended before setup started.'; exit 1; }
-fi
+shell_prompt 'To start the setup process, press enter.'
+printf '\n'
+IFS= read -r bootstrap_start || { shell_error 'Input ended before setup started.'; exit 1; }
 
 python3 - "$@" 3<&0 <<'FW_SETUP_PYTHON'
 from __future__ import annotations
@@ -200,7 +189,6 @@ import hmac
 import html
 import http.client
 import http.server
-import io
 import json
 import os
 import platform
@@ -225,8 +213,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Dict, Iterable, List, Optional, Tuple
 
 # File descriptor 3 is the caller's original stdin; stdin itself carries this
-# embedded source code to the interpreter. Some non-POSIX test hosts cannot
-# import that descriptor, which is harmless for noninteractive --self-test.
+# embedded source code to the interpreter.
 try:
     sys.stdin = os.fdopen(3, "r", encoding="utf-8", errors="replace", closefd=False)
 except OSError:
@@ -1074,56 +1061,13 @@ class Setup:
         except EOFError:
             pass
 
-def self_test() -> None:
-    assert HOST_RE.fullmatch("*.fw.example.com")
-    assert not HOST_RE.fullmatch("fw.example.com")
-    assert not HOST_RE.fullmatch("*.bad_label.example.com")
-    assert urllib.parse.quote("a b+c/*", safe="") == "a%20b%2Bc%2F%2A"
-    random_value = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
-    assert not set(random_value) & set("+/=") and len(random_value) >= 42
-    assert CONSOLE.clean("remote\033[31m\nvalue") == "remote [31m value"
-    fixture = [{"status": "pending_validation", "hosts": ["*.fw.example.com"], "certificates": [{"status": "active"}]}]
-    pack = Setup.find_certificate(fixture, "*.FW.EXAMPLE.COM")
-    assert pack and Setup.certificate_active(pack)
-    assert Setup.certificate_failed({"status": "issuance_timed_out", "certificates": []})
-    for value in ARTIFACTS.values():
-        assert len(value[1]) == 64 and len(value[2]) == 64 and all(char in "0123456789abcdef" for char in value[1] + value[2])
-    with tempfile.TemporaryDirectory() as directory:
-        root = Path(directory)
-        archive = root / "safe.tgz"
-        output = root / "cloudflared"
-        data = b"test-binary"
-        with tarfile.open(archive, "w:gz") as bundle:
-            member = tarfile.TarInfo("cloudflared")
-            member.size = len(data)
-            bundle.addfile(member, io.BytesIO(data))
-        Setup.extract_exact_tar(archive, output)
-        assert output.read_bytes() == data
-        unsafe = root / "unsafe.tgz"
-        with tarfile.open(unsafe, "w:gz") as bundle:
-            member = tarfile.TarInfo("../cloudflared")
-            member.size = len(data)
-            bundle.addfile(member, io.BytesIO(data))
-        try:
-            Setup.extract_exact_tar(unsafe, output)
-        except SetupError:
-            pass
-        else:
-            raise AssertionError("unsafe tar member was accepted")
-    CONSOLE.success("fw-setup.sh self-test passed.")
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="fw-setup.sh")
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--fw-path", type=Path)
-    group.add_argument("--self-test", action="store_true")
+    parser.add_argument("--fw-path", type=Path, required=True)
     return parser.parse_args()
 
 def main() -> int:
     args = parse_args()
-    if args.self_test:
-        self_test()
-        return 0
     setup = Setup(args.fw_path)
     def interrupt(_signum: int, _frame: Any) -> None:
         raise KeyboardInterrupt

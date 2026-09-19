@@ -64,3 +64,11 @@ This file records checkpoints, skipped procedures, and validation limits for wor
 - Local validation built a Windows GNU executable with synthetic `FW_APP_VERSION=9.8.7` metadata and confirmed that it reported `fw 9.8.7`.
 - Dry-run workflow `35371975259` used `version=0.1.10` and `publish=no`. Linux AMD64 and ARM64 each passed all 116 native tests, built successfully as musl binaries, passed setup-SHA, help, release-version, declined-setup URL, archive-layout, permission, symlink, and extracted-executable checks, and uploaded both portable archives.
 - The workflow completed successfully, and release publication remained disabled. The temporary Windows and Intel macOS exclusions were then removed; the production workflow again includes all platforms, with Apple Silicon returned to the previously successful `macos-14-arm64` label.
+
+## 2026-09-19 — Full native release validation completed
+
+- Dry-run workflow `35415140511` used `version=0.1.15` and `publish=no` from `feat/mac-linux` at `73023a1`.
+- Native Linux AMD64 and ARM64 tests, musl builds, archive verification, and packaging passed. Native macOS Intel and Apple Silicon tests, builds, archive verification, and packaging also passed, as did the Windows tests, portable builds, setup-entrypoint checks, and NSIS packaging.
+- The first macOS ARM64 package attempt failed only because GitHub's artifact service timed out all five `ListArtifacts` requests. Its build artifact had already uploaded successfully; rerunning the failed jobs cleared the infrastructure error without a code change.
+- The final assembly verified and uploaded all nine release files. `Create GitHub release` was skipped because publishing was disabled.
+- The `macos-15` Apple Silicon jobs received runner capacity and completed. No runner-capacity limitation remained in the successful run.
